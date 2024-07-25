@@ -8,6 +8,7 @@ tokio = { version = "1.39", features = ["full"] }
 anyhow = { version = "1.0", features = ["backtrace"] }
 renterd_client = { path = "../renterd_client" }
 chrono = "0.4"
+futures = "0.3"
 futures-util = "0.3"
 bimap = "0.6"
 itertools = "0.13"

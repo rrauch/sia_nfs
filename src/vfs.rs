@@ -3,14 +3,22 @@ use anyhow::{anyhow, bail, Result};
 use async_recursion::async_recursion;
 use bimap::BiHashMap;
 use chrono::{DateTime, Utc};
+use futures::{AsyncRead, AsyncSeek};
 use futures_util::TryStreamExt;
 use itertools::{Either, Itertools};
 use renterd_client::Client as RenterdClient;
 use sqlx::FromRow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Display, Formatter};
+use std::io::SeekFrom;
 use std::num::NonZeroUsize;
+use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::sync::{OwnedRwLockReadGuard, RwLock};
+use tokio::task::JoinHandle;
 
 const ROOT_ID: u64 = 1;
 
@@ -20,6 +28,14 @@ pub(crate) struct Vfs {
     root: Directory,
     bucket_ids: BiHashMap<u64, String>,
     buckets: BTreeMap<u64, Directory>,
+    file_locks: Arc<Mutex<HashMap<u64, Arc<RwLock<u64>>>>>,
+    lock_gc: JoinHandle<()>,
+}
+
+impl Drop for Vfs {
+    fn drop(&mut self) {
+        self.lock_gc.abort();
+    }
 }
 
 impl Vfs {
@@ -161,6 +177,21 @@ impl Vfs {
             })
             .collect::<BTreeMap<_, _>>();
 
+        let file_locks = Arc::new(Mutex::new(HashMap::new()));
+        let lock_gc = {
+            let file_locks = file_locks.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    {
+                        let mut locks = file_locks.lock().expect("unable to get file locks");
+                        // remove all locks currently not held outside this map
+                        locks.retain(|id, lock| Arc::strong_count(lock) > 1)
+                    }
+                }
+            })
+        };
+
         Ok(Self {
             renterd,
             db,
@@ -172,6 +203,8 @@ impl Vfs {
             },
             buckets,
             bucket_ids,
+            file_locks,
+            lock_gc,
         })
     }
 
@@ -239,7 +272,7 @@ impl Vfs {
             }
         };
 
-        if metadata.name != path {
+        if metadata.name != path && metadata.name != format!("{}/", path) {
             bail!("incorrect metadata name");
         }
 
@@ -563,10 +596,102 @@ impl Vfs {
 
         Ok(known)
     }
+
+    pub async fn read_file(&self, file: &File) -> Result<FileReader> {
+        let rw_lock = {
+            let mut lock = self.file_locks.lock().expect("unable to lock file_locks");
+            lock.entry(file.id())
+                .or_insert_with(|| Arc::new(RwLock::new(file.id())))
+                .clone()
+        };
+        // acquire the actual read lock
+        let _lock = rw_lock.read_owned().await;
+
+        let (bucket, path) = self
+            .inode_to_bucket_path(Inode::File(file.clone()))
+            .await?
+            .ok_or(anyhow!("invalid file"))?;
+
+        let object = self
+            .renterd
+            .worker()
+            .object()
+            .download(path, Some(bucket))
+            .await?
+            .ok_or(anyhow!("renterd couldn't find the file"))?;
+
+        let size = object.length.ok_or(anyhow!("file size is unknown"))?;
+        let stream = object.open_seekable_stream().await?;
+
+        Ok(FileReader {
+            file: file.clone(),
+            offset: 0,
+            size,
+            stream: Box::new(stream),
+            _lock,
+        })
+    }
+}
+
+pub struct FileReader {
+    file: File,
+    _lock: OwnedRwLockReadGuard<u64>,
+    offset: u64,
+    size: u64,
+    stream: Box<dyn ReadStream + Send + Unpin>,
+}
+
+impl FileReader {
+    pub fn file(&self) -> &File {
+        &self.file
+    }
+
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub fn eof(&self) -> bool {
+        self.offset == self.size
+    }
+}
+
+trait ReadStream: AsyncRead + AsyncSeek {}
+impl<T: AsyncRead + AsyncSeek> ReadStream for T {}
+
+impl AsyncRead for FileReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let result = Pin::new(&mut self.stream).poll_read(cx, buf);
+        if let Poll::Ready(Ok(bytes_read)) = result {
+            self.offset += bytes_read as u64;
+        }
+        result
+    }
+}
+
+impl AsyncSeek for FileReader {
+    fn poll_seek(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        pos: SeekFrom,
+    ) -> Poll<std::io::Result<u64>> {
+        let result = Pin::new(&mut self.stream).poll_seek(cx, pos);
+        if let Poll::Ready(Ok(position)) = result {
+            self.offset = position;
+        }
+        result
+    }
 }
 
 #[derive(PartialEq, Clone)]
-enum InodeType {
+pub enum InodeType {
     Directory,
     File,
 }

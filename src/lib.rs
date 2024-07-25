@@ -33,6 +33,7 @@ impl SiaNfs {
         let db = db_init(db_path, 20, true).await?;
 
         let vfs = Vfs::new(renterd, db, buckets).await?;
+        //Self::foo(&vfs).await?;
 
         Ok(Self {
             listener: NFSTcpListener::bind("127.0.0.1:12000", SiaNfsFs::new(vfs)).await?,

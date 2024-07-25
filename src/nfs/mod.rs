@@ -1,23 +1,35 @@
+mod download;
+
+use crate::nfs::download::DownloadManager;
 use crate::vfs::{Inode, Vfs};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use futures_util::TryFutureExt;
+use futures_util::AsyncReadExt;
 use nfsserve::nfs::nfsstat3::{
-    NFS3ERR_NOENT, NFS3ERR_NOTDIR, NFS3ERR_NOTSUPP, NFS3ERR_SERVERFAULT,
+    NFS3ERR_IO, NFS3ERR_ISDIR, NFS3ERR_NOENT, NFS3ERR_NOTDIR, NFS3ERR_NOTSUPP, NFS3ERR_SERVERFAULT,
 };
 use nfsserve::nfs::{
     fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3,
 };
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
+use std::sync::Arc;
+use std::time::Duration;
+use tracing::instrument;
 
 pub(crate) struct SiaNfsFs {
-    vfs: Vfs,
+    vfs: Arc<Vfs>,
+    download_manager: DownloadManager,
 }
 
 impl SiaNfsFs {
     pub(super) fn new(vfs: Vfs) -> Self {
-        Self { vfs }
+        let vfs = Arc::new(vfs);
+        let download_manager = DownloadManager::new(vfs.clone(), 20, Duration::from_secs(20));
+        Self {
+            download_manager,
+            vfs,
+        }
     }
 }
 
@@ -31,14 +43,17 @@ impl NFSFileSystem for SiaNfsFs {
         self.vfs.root().id()
     }
 
+    #[instrument(skip(self))]
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
         let name = std::str::from_utf8(filename).map_err(|_| NFS3ERR_SERVERFAULT)?;
         match self
             .vfs
             .inode_by_name_parent(name, dirid)
             .await
-            .map_err(|_| NFS3ERR_SERVERFAULT)?
-        {
+            .map_err(|e| {
+                tracing::error!(err = %e, "lookup failed");
+                NFS3ERR_SERVERFAULT
+            })? {
             Some(inode) => Ok(inode.id()),
             None => Err(NFS3ERR_NOENT),
         }
@@ -60,13 +75,57 @@ impl NFSFileSystem for SiaNfsFs {
         Err(NFS3ERR_NOTSUPP)
     }
 
+    #[instrument(skip(self))]
     async fn read(
         &self,
         id: fileid3,
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
-        Err(NFS3ERR_NOTSUPP)
+        let file = match self
+            .vfs
+            .inode_by_id(id)
+            .await
+            .map_err(|_| NFS3ERR_SERVERFAULT)?
+        {
+            Some(Inode::File(file)) => file,
+            Some(Inode::Directory(_)) => return Err(NFS3ERR_ISDIR),
+            None => return Err(NFS3ERR_NOENT),
+        };
+
+        // make sure we don't read beyond eof
+        let count = {
+            let count = count as u64;
+            if offset + count >= file.size() {
+                (file.size() - offset) as usize
+            } else {
+                count as usize
+            }
+        };
+
+        if count == 0 {
+            return Ok((vec![], true));
+        }
+
+        let mut dl = self
+            .download_manager
+            .download(&file, offset)
+            .await
+            .map_err(|_| NFS3ERR_SERVERFAULT)?;
+
+        let mut buf = Vec::with_capacity(count as usize);
+        buf.resize(buf.capacity(), 0x00);
+        dl.reader().read_exact(&mut buf).await.map_err(|e| {
+            tracing::error!(error = %e, "read error");
+            NFS3ERR_IO
+        })?;
+        let eof = dl.eof();
+
+        // return the download to the pool
+        if !eof {
+            dl.recycle();
+        }
+        Ok((buf, eof))
     }
 
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
