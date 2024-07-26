@@ -42,7 +42,7 @@ impl SiaNfsFs {
 #[async_trait]
 impl NFSFileSystem for SiaNfsFs {
     fn capabilities(&self) -> VFSCapabilities {
-        VFSCapabilities::ReadOnly
+        VFSCapabilities::ReadWrite
     }
 
     fn root_dir(&self) -> fileid3 {
@@ -155,7 +155,25 @@ impl NFSFileSystem for SiaNfsFs {
         dirid: fileid3,
         dirname: &filename3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        Err(NFS3ERR_NOTSUPP)
+        let name = std::str::from_utf8(dirname).map_err(|_| NFS3ERR_SERVERFAULT)?;
+        let parent = match self
+            .vfs
+            .inode_by_id(dirid)
+            .await
+            .map_err(|_| NFS3ERR_SERVERFAULT)?
+        {
+            Some(Inode::File(_)) => return Err(NFS3ERR_NOTDIR),
+            Some(Inode::Directory(dir)) => dir,
+            None => return Err(NFS3ERR_NOENT),
+        };
+
+        let dir = self
+            .vfs
+            .mkdir(&parent, name.to_string())
+            .await
+            .map_err(|_| NFS3ERR_SERVERFAULT)?;
+
+        Ok((dir.id(), to_fattr3(&Inode::Directory(dir))))
     }
 
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {

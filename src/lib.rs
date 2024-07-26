@@ -2,7 +2,7 @@ mod nfs;
 mod vfs;
 
 use crate::nfs::SiaNfsFs;
-use crate::vfs::{Inode, Vfs};
+use crate::vfs::Vfs;
 use anyhow::Result;
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};

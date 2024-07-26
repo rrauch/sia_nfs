@@ -4,6 +4,7 @@ use async_recursion::async_recursion;
 use bimap::BiHashMap;
 use chrono::{DateTime, Utc};
 use futures::{AsyncRead, AsyncSeek};
+use futures_util::io::Cursor;
 use futures_util::TryStreamExt;
 use itertools::{Either, Itertools};
 use renterd_client::Client as RenterdClient;
@@ -190,7 +191,7 @@ impl Vfs {
                     {
                         let mut locks = file_locks.lock().expect("unable to get file locks");
                         // remove all locks currently not held outside this map
-                        locks.retain(|id, lock| Arc::strong_count(lock) > 1)
+                        locks.retain(|_, lock| Arc::strong_count(lock) > 1)
                     }
                 }
             })
@@ -645,6 +646,39 @@ impl Vfs {
             _lock,
             _download_permit,
         })
+    }
+
+    pub async fn mkdir(&self, parent: &Directory, name: String) -> Result<Directory> {
+        if let Some(_) = self
+            .inode_by_name_parent(name.as_str(), parent.id())
+            .await?
+        {
+            // an inode with the same name already exists in the parent directory
+            bail!("inode already exists");
+        }
+
+        if name.ends_with("/") {
+            bail!("invalid name");
+        }
+
+        let (bucket, path) = self
+            .inode_to_bucket_path(Inode::Directory(parent.clone()))
+            .await?
+            .ok_or(anyhow!("directory not found"))?;
+
+        // a directory is created by uploading an empty file with a name ending in "/"
+        let path = format!("{}{}/", path, name);
+        self.renterd
+            .worker()
+            .object()
+            .upload(path, None, Some(bucket), Cursor::new(vec![]))
+            .await?;
+
+        // looking good
+        match self.inode_by_name_parent(name, parent.id()).await? {
+            Some(Inode::Directory(dir)) => Ok(dir),
+            _ => Err(anyhow!("directory creation failed")),
+        }
     }
 }
 
