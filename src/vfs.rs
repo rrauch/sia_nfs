@@ -605,13 +605,6 @@ impl Vfs {
     }
 
     pub async fn read_file(&self, file: &File) -> Result<FileReader> {
-        tracing::trace!("waiting for download permit");
-        let _download_permit = timeout(
-            Duration::from_secs(60),
-            self.download_limiter.clone().acquire_owned(),
-        )
-        .await??;
-
         let rw_lock = {
             let mut lock = self.file_locks.lock().expect("unable to lock file_locks");
             lock.entry(file.id())
@@ -619,7 +612,14 @@ impl Vfs {
                 .clone()
         };
         // acquire the actual read lock
-        let _lock = rw_lock.read_owned().await;
+        let _lock = timeout(Duration::from_secs(60), rw_lock.read_owned()).await?;
+
+        tracing::trace!("waiting for download permit");
+        let _download_permit = timeout(
+            Duration::from_secs(60),
+            self.download_limiter.clone().acquire_owned(),
+        )
+        .await??;
 
         let (bucket, path) = self
             .inode_to_bucket_path(Inode::File(file.clone()))
