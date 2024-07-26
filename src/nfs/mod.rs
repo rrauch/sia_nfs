@@ -25,7 +25,7 @@ pub(crate) struct SiaNfsFs {
 impl SiaNfsFs {
     pub(super) fn new(vfs: Vfs) -> Self {
         let vfs = Arc::new(vfs);
-        let download_manager = DownloadManager::new(vfs.clone(), 20, Duration::from_secs(20));
+        let download_manager = DownloadManager::new(vfs.clone(), 20, Duration::from_secs(5));
         Self {
             download_manager,
             vfs,
@@ -113,7 +113,7 @@ impl NFSFileSystem for SiaNfsFs {
             .await
             .map_err(|_| NFS3ERR_SERVERFAULT)?;
 
-        let mut buf = Vec::with_capacity(count as usize);
+        let mut buf = Vec::with_capacity(count);
         buf.resize(buf.capacity(), 0x00);
         dl.read_exact(&mut buf).await.map_err(|e| {
             tracing::error!(error = %e, "read error");

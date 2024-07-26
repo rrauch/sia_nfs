@@ -8,7 +8,7 @@ use tracing_subscriber::EnvFilter;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .without_time()
+        //.without_time()
         .with_env_filter(
             EnvFilter::builder()
                 .with_default_directive(Level::DEBUG.into())
