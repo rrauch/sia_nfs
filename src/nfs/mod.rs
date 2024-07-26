@@ -115,17 +115,12 @@ impl NFSFileSystem for SiaNfsFs {
 
         let mut buf = Vec::with_capacity(count as usize);
         buf.resize(buf.capacity(), 0x00);
-        dl.reader().read_exact(&mut buf).await.map_err(|e| {
+        dl.read_exact(&mut buf).await.map_err(|e| {
             tracing::error!(error = %e, "read error");
             NFS3ERR_IO
         })?;
-        let eof = dl.eof();
 
-        // return the download to the pool
-        if !eof {
-            dl.recycle();
-        }
-        Ok((buf, eof))
+        Ok((buf, dl.eof()))
     }
 
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {

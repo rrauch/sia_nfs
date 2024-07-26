@@ -1,8 +1,12 @@
 use crate::vfs::{File, FileReader, Vfs};
 use anyhow::{anyhow, bail, Result};
+use futures::{AsyncRead, AsyncSeek};
 use futures_util::AsyncSeekExt;
+use std::io;
 use std::io::SeekFrom;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -95,7 +99,7 @@ impl DownloadManager {
                     "initiating new download"
                 );
 
-                let mut file_reader = self.vfs.read_file(file).await?;
+                let file_reader = self.vfs.read_file(file).await?;
                 DownloadInner { file_reader }
             }
         };
@@ -110,6 +114,7 @@ impl DownloadManager {
             pool: self.idle.clone(),
             notify_reaper: self.notify_reaper.clone(),
             max_idle: self.max_idle.clone(),
+            io_error: false,
         })
     }
 
@@ -148,22 +153,10 @@ pub(crate) struct Download {
     pool: Arc<Mutex<Vec<(DownloadInner, SystemTime)>>>,
     max_idle: Duration,
     notify_reaper: Arc<Notify>,
+    io_error: bool,
 }
 
 impl Download {
-    #[instrument(skip(self))]
-    pub fn recycle(mut self) {
-        if let Some(inner) = self.inner.take() {
-            {
-                let mut pool = self.pool.lock().unwrap();
-                let expires = SystemTime::now() + self.max_idle;
-                pool.push((inner, expires));
-            }
-            self.notify_reaper.notify_one();
-            tracing::debug!("download returned to pool");
-        }
-    }
-
     pub fn eof(&self) -> bool {
         match &self.inner {
             None => true,
@@ -171,8 +164,64 @@ impl Download {
         }
     }
 
-    pub fn reader(&mut self) -> &mut FileReader {
-        &mut self.inner.as_mut().unwrap().file_reader
+    pub fn offset(&self) -> u64 {
+        self.inner.as_ref().unwrap().file_reader.offset()
+    }
+}
+
+impl Drop for Download {
+    #[instrument(skip(self))]
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            // only return it if there was no io error and eof is not yet reached
+            if !self.io_error && !inner.file_reader.eof() {
+                {
+                    let mut pool = self.pool.lock().unwrap();
+                    let expires = SystemTime::now() + self.max_idle;
+                    pool.push((inner, expires));
+                }
+                self.notify_reaper.notify_one();
+                tracing::debug!("download returned to pool");
+            }
+        }
+    }
+}
+
+impl AsyncRead for Download {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let inner = match self.inner.as_mut() {
+            Some(inner) => inner,
+            None => return Poll::Ready(Ok(0)),
+        };
+
+        let result = Pin::new(&mut inner.file_reader).poll_read(cx, buf);
+        if let Poll::Ready(Err(_)) = &result {
+            self.io_error = true;
+        }
+        result
+    }
+}
+
+impl AsyncSeek for Download {
+    fn poll_seek(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        pos: SeekFrom,
+    ) -> Poll<io::Result<u64>> {
+        let inner = match self.inner.as_mut() {
+            Some(inner) => inner,
+            None => return Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe))),
+        };
+
+        let result = Pin::new(&mut inner.file_reader).poll_seek(cx, pos);
+        if let Poll::Ready(Err(_)) = &result {
+            self.io_error = true;
+        }
+        result
     }
 }
 
