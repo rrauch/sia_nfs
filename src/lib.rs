@@ -7,6 +7,7 @@ use anyhow::Result;
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{ConnectOptions, Pool, Sqlite};
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::Duration;
 use tracing::log::LevelFilter;
@@ -32,11 +33,15 @@ impl SiaNfs {
 
         let db = db_init(db_path, 20, true).await?;
 
-        let vfs = Vfs::new(renterd, db, buckets).await?;
+        let vfs = Vfs::new(renterd, db, buckets, NonZeroUsize::new(25).unwrap()).await?;
         //Self::foo(&vfs).await?;
 
         Ok(Self {
-            listener: NFSTcpListener::bind("127.0.0.1:12000", SiaNfsFs::new(vfs)).await?,
+            listener: NFSTcpListener::bind(
+                "127.0.0.1:12000",
+                SiaNfsFs::new(vfs, NonZeroUsize::new(5).unwrap(), Duration::from_secs(3)),
+            )
+            .await?,
         })
     }
 

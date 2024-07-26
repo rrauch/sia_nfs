@@ -17,8 +17,10 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::sync::{OwnedRwLockReadGuard, RwLock};
+use tokio::sync::{OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
+use tracing::instrument;
 
 const ROOT_ID: u64 = 1;
 
@@ -29,6 +31,7 @@ pub(crate) struct Vfs {
     bucket_ids: BiHashMap<u64, String>,
     buckets: BTreeMap<u64, Directory>,
     file_locks: Arc<Mutex<HashMap<u64, Arc<RwLock<u64>>>>>,
+    download_limiter: Arc<Semaphore>,
     lock_gc: JoinHandle<()>,
 }
 
@@ -43,6 +46,7 @@ impl Vfs {
         renterd: RenterdClient,
         db: SqlitePool,
         buckets: T,
+        max_concurrent_downloads: NonZeroUsize,
     ) -> Result<Self>
     where
         T: IntoIterator<Item = I>,
@@ -192,6 +196,8 @@ impl Vfs {
             })
         };
 
+        let download_limiter = Arc::new(Semaphore::new(max_concurrent_downloads.get()));
+
         Ok(Self {
             renterd,
             db,
@@ -204,6 +210,7 @@ impl Vfs {
             buckets,
             bucket_ids,
             file_locks,
+            download_limiter,
             lock_gc,
         })
     }
@@ -598,6 +605,13 @@ impl Vfs {
     }
 
     pub async fn read_file(&self, file: &File) -> Result<FileReader> {
+        tracing::trace!("waiting for download permit");
+        let _download_permit = timeout(
+            Duration::from_secs(60),
+            self.download_limiter.clone().acquire_owned(),
+        )
+        .await??;
+
         let rw_lock = {
             let mut lock = self.file_locks.lock().expect("unable to lock file_locks");
             lock.entry(file.id())
@@ -629,6 +643,7 @@ impl Vfs {
             size,
             stream: Box::new(stream),
             _lock,
+            _download_permit,
         })
     }
 }
@@ -636,6 +651,7 @@ impl Vfs {
 pub struct FileReader {
     file: File,
     _lock: OwnedRwLockReadGuard<u64>,
+    _download_permit: OwnedSemaphorePermit,
     offset: u64,
     size: u64,
     stream: Box<dyn ReadStream + Send + Unpin>,
@@ -687,6 +703,18 @@ impl AsyncSeek for FileReader {
             self.offset = position;
         }
         result
+    }
+}
+
+impl Drop for FileReader {
+    #[instrument(skip(self), name = "file_reader_drop")]
+    fn drop(&mut self) {
+        tracing::debug!(
+            id = self.file.id,
+            name = self.file.name,
+            offset = self.offset,
+            "file_reader closed"
+        );
     }
 }
 

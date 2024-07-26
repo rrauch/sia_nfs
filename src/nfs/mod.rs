@@ -13,6 +13,7 @@ use nfsserve::nfs::{
     fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3,
 };
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::instrument;
@@ -23,9 +24,14 @@ pub(crate) struct SiaNfsFs {
 }
 
 impl SiaNfsFs {
-    pub(super) fn new(vfs: Vfs) -> Self {
+    pub(super) fn new(
+        vfs: Vfs,
+        max_downloads_per_file: NonZeroUsize,
+        max_download_idle: Duration,
+    ) -> Self {
         let vfs = Arc::new(vfs);
-        let download_manager = DownloadManager::new(vfs.clone(), 20, Duration::from_secs(5));
+        let download_manager =
+            DownloadManager::new(vfs.clone(), max_downloads_per_file, max_download_idle);
         Self {
             download_manager,
             vfs,
