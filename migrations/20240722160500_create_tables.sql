@@ -52,6 +52,17 @@ BEGIN
     SELECT RAISE(ABORT, 'Cannot update root directory');
 END;
 
+/* A temp table to capture deleted ids */
+CREATE TABLE deleted_fs_entries (
+    id INTEGER NOT NULL
+);
+
+CREATE TRIGGER capture_deleted_fs_entry_id
+AFTER DELETE ON fs_entries
+BEGIN
+    INSERT INTO deleted_fs_entries (id) VALUES (OLD.id);
+END;
+
 /* create the root entry */
 INSERT INTO fs_entries (id, entry_type, name, parent)
 VALUES (1, 'D', '_ROOT_INTERNAL_DO_NOT_USE_', 1);

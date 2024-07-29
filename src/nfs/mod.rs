@@ -177,7 +177,25 @@ impl NFSFileSystem for SiaNfsFs {
     }
 
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
-        Err(NFS3ERR_NOTSUPP)
+        let name = std::str::from_utf8(filename).map_err(|_| NFS3ERR_SERVERFAULT)?;
+        let inode = match self
+            .vfs
+            .inode_by_name_parent(name, dirid)
+            .await
+            .map_err(|e| {
+                tracing::error!(err = %e, "lookup failed");
+                NFS3ERR_SERVERFAULT
+            })? {
+            Some(inode) => inode,
+            None => return Err(NFS3ERR_NOENT),
+        };
+
+        self.vfs.rm(&inode).await.map_err(|e| {
+            tracing::error!(err = %e, "rm failed");
+            NFS3ERR_SERVERFAULT
+        })?;
+
+        Ok(())
     }
 
     async fn rename(

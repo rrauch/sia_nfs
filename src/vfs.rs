@@ -5,11 +5,11 @@ use bimap::BiHashMap;
 use chrono::{DateTime, Utc};
 use futures::{AsyncRead, AsyncSeek};
 use futures_util::io::Cursor;
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use itertools::{Either, Itertools};
 use renterd_client::Client as RenterdClient;
 use sqlx::FromRow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::io::SeekFrom;
 use std::num::NonZeroUsize;
@@ -18,10 +18,12 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::sync::{OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{
+    OwnedRwLockReadGuard, OwnedRwLockWriteGuard, OwnedSemaphorePermit, RwLock, Semaphore,
+};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
-use tracing::instrument;
+use tracing::{info, instrument};
 
 const ROOT_ID: u64 = 1;
 
@@ -31,7 +33,7 @@ pub(crate) struct Vfs {
     root: Directory,
     bucket_ids: BiHashMap<u64, String>,
     buckets: BTreeMap<u64, Directory>,
-    file_locks: Arc<Mutex<HashMap<u64, Arc<RwLock<u64>>>>>,
+    file_locks: Arc<Mutex<HashMap<String, Arc<RwLock<()>>>>>,
     download_limiter: Arc<Semaphore>,
     lock_gc: JoinHandle<()>,
 }
@@ -469,6 +471,8 @@ impl Vfs {
             .await?
             .ok_or(anyhow!("invalid dir"))?;
 
+        let _read_lock = self.read_lock(&bucket, &path).await?;
+
         let mut stream = match self
             .renterd
             .bus()
@@ -605,15 +609,34 @@ impl Vfs {
         Ok(known)
     }
 
+    async fn read_lock(&self, bucket: &str, path: &str) -> Result<OwnedRwLockReadGuard<()>> {
+        let rw_lock = self._rw_lock(bucket, path);
+        tracing::trace!("acquiring read lock for /{}{}", bucket, path);
+        Ok(timeout(Duration::from_secs(60), rw_lock.read_owned()).await?)
+    }
+
+    async fn write_lock(&self, bucket: &str, path: &str) -> Result<OwnedRwLockWriteGuard<()>> {
+        let rw_lock = self._rw_lock(bucket, path);
+        tracing::trace!("acquiring write lock for /{}{}", bucket, path);
+        Ok(timeout(Duration::from_secs(60), rw_lock.write_owned()).await?)
+    }
+
+    fn _rw_lock(&self, bucket: &str, path: &str) -> Arc<RwLock<()>> {
+        let path = format!("/{}{}", bucket, path);
+        let mut lock = self.file_locks.lock().expect("unable to lock file_locks");
+        lock.entry(path)
+            .or_insert_with(|| Arc::new(RwLock::new(())))
+            .clone()
+    }
+
     pub async fn read_file(&self, file: &File) -> Result<FileReader> {
-        let rw_lock = {
-            let mut lock = self.file_locks.lock().expect("unable to lock file_locks");
-            lock.entry(file.id())
-                .or_insert_with(|| Arc::new(RwLock::new(file.id())))
-                .clone()
-        };
+        let (bucket, path) = self
+            .inode_to_bucket_path(Inode::File(file.clone()))
+            .await?
+            .ok_or(anyhow!("invalid file"))?;
+
         // acquire the actual read lock
-        let _lock = timeout(Duration::from_secs(60), rw_lock.read_owned()).await?;
+        let _read_lock = self.read_lock(&bucket, &path).await?;
 
         tracing::trace!("waiting for download permit");
         let _download_permit = timeout(
@@ -621,11 +644,6 @@ impl Vfs {
             self.download_limiter.clone().acquire_owned(),
         )
         .await??;
-
-        let (bucket, path) = self
-            .inode_to_bucket_path(Inode::File(file.clone()))
-            .await?
-            .ok_or(anyhow!("invalid file"))?;
 
         let object = self
             .renterd
@@ -643,12 +661,24 @@ impl Vfs {
             offset: 0,
             size,
             stream: Box::new(stream),
-            _lock,
+            _read_lock,
             _download_permit,
         })
     }
 
+    #[instrument(skip(self))]
     pub async fn mkdir(&self, parent: &Directory, name: String) -> Result<Directory> {
+        if parent.parent == self.root.id() {
+            bail!("unable to write in root directory");
+        }
+
+        let (bucket, path) = self
+            .inode_to_bucket_path(Inode::Directory(parent.clone()))
+            .await?
+            .ok_or(anyhow!("directory not found"))?;
+        // lock the parent path first
+        let _write_lock = self.write_lock(&bucket, &path).await?;
+
         if let Some(_) = self
             .inode_by_name_parent(name.as_str(), parent.id())
             .await?
@@ -661,30 +691,128 @@ impl Vfs {
             bail!("invalid name");
         }
 
-        let (bucket, path) = self
-            .inode_to_bucket_path(Inode::Directory(parent.clone()))
-            .await?
-            .ok_or(anyhow!("directory not found"))?;
-
         // a directory is created by uploading an empty file with a name ending in "/"
         let path = format!("{}{}/", path, name);
         self.renterd
             .worker()
             .object()
-            .upload(path, None, Some(bucket), Cursor::new(vec![]))
+            .upload(
+                path.as_str(),
+                None,
+                Some(bucket.clone()),
+                Cursor::new(vec![]),
+            )
             .await?;
 
         // looking good
         match self.inode_by_name_parent(name, parent.id()).await? {
-            Some(Inode::Directory(dir)) => Ok(dir),
+            Some(Inode::Directory(dir)) => {
+                info!("created directory /{}{} ({})", bucket, path, dir.id());
+                Ok(dir)
+            }
             _ => Err(anyhow!("directory creation failed")),
         }
+    }
+
+    #[instrument(skip(self))]
+    pub async fn rm(&self, inode: &Inode) -> Result<()> {
+        if inode.parent() == self.root.id() {
+            bail!("unable to write in root directory");
+        }
+
+        let (bucket, path) = self
+            .inode_to_bucket_path(inode.clone())
+            .await?
+            .ok_or(anyhow!("inode not found"))?;
+
+        let _write_lock = self.write_lock(&bucket, &path).await?;
+
+        // do a live-lookup first to make sure the local state is accurate
+        match self
+            .renterd
+            .bus()
+            .object()
+            .get_stream(
+                path.as_str(),
+                NonZeroUsize::new(10).unwrap(),
+                None,
+                Some(bucket.clone()),
+            )
+            .await?
+            .ok_or(anyhow!("path not found"))?
+        {
+            Either::Left(_) => {
+                if inode.inode_type() != InodeType::File {
+                    //todo
+                    bail!("unexpected type, expected directory but found file");
+                }
+            }
+            Either::Right(stream) => {
+                if inode.inode_type() != InodeType::Directory {
+                    //todo
+                    bail!("unexpected type, expected file but found directory");
+                }
+
+                if stream.count().await != 0 {
+                    // the directory is not empty
+                    bail!("directory not empty");
+                }
+            }
+        };
+
+        // things are looking good, proceed with deletion
+
+        self.renterd
+            .worker()
+            .object()
+            .delete(path.as_str(), Some(bucket.clone()), false)
+            .await?;
+
+        // track all affected ids by this deletion
+        let mut affected_ids = HashSet::new();
+        affected_ids.insert(inode.parent());
+        affected_ids.insert(inode.id());
+
+        // update the database
+        let mut tx = self.db.write().begin().await?;
+
+        // first, clean up the temp id table
+        let _ = sqlx::query!("DELETE FROM deleted_fs_entries")
+            .execute(tx.as_mut())
+            .await?;
+
+        // then delete the inode
+        let id = inode.id() as i64;
+        let _ = sqlx::query!("DELETE FROM fs_entries WHERE id = ?", id)
+            .execute(tx.as_mut())
+            .await?;
+
+        // the table has a "ON DELETE CASCADE" constraint, so any child inodes have been automatically deleted
+        // the ids of all deleted items will end up in the temp table (this is done by the delete trigger)
+        sqlx::query!("SELECT id FROM deleted_fs_entries")
+            .fetch_all(tx.as_mut())
+            .await?
+            .into_iter()
+            .for_each(|r| {
+                affected_ids.insert(r.id as u64);
+            });
+
+        // clean up the temp table again
+        let _ = sqlx::query!("DELETE FROM deleted_fs_entries")
+            .execute(tx.as_mut())
+            .await?;
+
+        tx.commit().await?;
+
+        info!("deleted /{}{} ({})", bucket, path, inode.id());
+
+        Ok(())
     }
 }
 
 pub struct FileReader {
     file: File,
-    _lock: OwnedRwLockReadGuard<u64>,
+    _read_lock: OwnedRwLockReadGuard<()>,
     _download_permit: OwnedSemaphorePermit,
     offset: u64,
     size: u64,
