@@ -7,6 +7,7 @@ use futures::{AsyncRead, AsyncSeek};
 use futures_util::io::Cursor;
 use futures_util::{StreamExt, TryStreamExt};
 use itertools::{Either, Itertools};
+use renterd_client::bus::object::RenameMode;
 use renterd_client::Client as RenterdClient;
 use sqlx::FromRow;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -283,7 +284,8 @@ impl Vfs {
         };
 
         if metadata.name != path && metadata.name != format!("{}/", path) {
-            bail!("incorrect metadata name");
+            // this is a different entry
+            return Ok(None);
         }
 
         let inode_type = if metadata.name.ends_with('/') {
@@ -705,7 +707,7 @@ impl Vfs {
 
     #[instrument(skip(self))]
     pub async fn mkdir(&self, parent: &Directory, name: String) -> Result<Directory> {
-        if parent.parent == self.root.id() {
+        if parent.id() == self.root.id() {
             bail!("unable to write in root directory");
         }
 
@@ -768,7 +770,21 @@ impl Vfs {
             .await?
             .ok_or(anyhow!("inode not found"))?;
 
-        let _write_lock = self.lock([LockRequest::write(&bucket, &path)]).await?;
+        let (_, parent_path) = self
+            .inode_to_bucket_path(
+                self.inode_by_id(inode.parent())
+                    .await?
+                    .ok_or(anyhow!("parent not found"))?,
+            )
+            .await?
+            .ok_or(anyhow!("parent not found"))?;
+
+        let _write_lock = self
+            .lock([
+                LockRequest::write(&bucket, &path),
+                LockRequest::read(&bucket, &parent_path),
+            ])
+            .await?;
 
         // do a live-lookup first to make sure the local state is accurate
         match self
@@ -848,6 +864,180 @@ impl Vfs {
         tx.commit().await?;
 
         info!("deleted /{}{} ({})", bucket, path, inode.id());
+
+        Ok(())
+    }
+
+    pub async fn mv(
+        &self,
+        source: &Inode,
+        target_dir: &Directory,
+        target_name: Option<String>,
+    ) -> Result<()> {
+        if source.parent() == self.root.id() || target_dir.id() == self.root.id() {
+            bail!("unable to write in root directory");
+        }
+
+        if source.parent() == target_dir.id() {
+            if target_name.is_none() || target_name.as_ref().unwrap() == source.name() {
+                // nothing to do here
+                return Ok(());
+            }
+        }
+
+        if source.id() == target_dir.id() {
+            bail!("cannot move into self");
+        }
+
+        let (bucket, source_path) = self
+            .inode_to_bucket_path(source.clone())
+            .await?
+            .ok_or(anyhow!("inode not found"))?;
+
+        let (_, source_parent_path) = self
+            .inode_to_bucket_path(
+                self.inode_by_id(source.parent())
+                    .await?
+                    .ok_or(anyhow!("parent not found"))?,
+            )
+            .await?
+            .ok_or(anyhow!("parent not found"))?;
+
+        let target_name = target_name.unwrap_or(source.name().to_string());
+
+        let (target_bucket, target_parent_path) = self
+            .inode_to_bucket_path(Inode::Directory(target_dir.clone()))
+            .await?
+            .ok_or(anyhow!("inode not found"))?;
+
+        if target_bucket != bucket {
+            bail!("cannot move between buckets");
+        }
+
+        let tail = if source.inode_type() == InodeType::Directory {
+            "/"
+        } else {
+            ""
+        };
+        let target_path = format!("{}{}{}", target_parent_path, target_name, tail);
+
+        let _locks = self
+            .lock([
+                LockRequest::read(bucket.as_str(), source_parent_path.as_str()),
+                LockRequest::write(bucket.as_str(), source_path.as_str()),
+                LockRequest::read(bucket.as_str(), target_parent_path.as_str()),
+                LockRequest::write(bucket.as_str(), target_path.as_str()),
+            ])
+            .await?;
+
+        // live-check first
+        // make sure that the source exists
+        if !{
+            match self
+                .renterd
+                .bus()
+                .object()
+                .list(
+                    NonZeroUsize::new(1).unwrap(),
+                    Some(source_path.clone()),
+                    Some(bucket.clone()),
+                )?
+                .try_next()
+                .await
+            {
+                Ok(Some(_)) => true,
+                _ => false,
+            }
+        } {
+            bail!("source does not exist");
+        }
+
+        // and that the target does not
+        if {
+            match self
+                .renterd
+                .bus()
+                .object()
+                .list(
+                    NonZeroUsize::new(1).unwrap(),
+                    Some(target_path.clone()),
+                    Some(bucket.clone()),
+                )?
+                .try_next()
+                .await
+            {
+                Ok(Some(_)) => true,
+                _ => false,
+            }
+        } {
+            bail!("destination already exists");
+        }
+
+        // looks promising, proceeding
+
+        self.renterd
+            .bus()
+            .object()
+            .rename(
+                source_path.clone(),
+                target_path.clone(),
+                bucket.clone(),
+                true,
+                RenameMode::Multi,
+            )
+            .await?;
+
+        let mut affected_ids = HashSet::new();
+        affected_ids.insert(source.id());
+        affected_ids.insert(source.parent());
+        affected_ids.insert(target_dir.id());
+
+        let mut tx = self.db.write().begin().await?;
+
+        // update db entry
+        let id = source.id() as i64;
+        {
+            let parent = target_dir.id() as i64;
+            sqlx::query!(
+                "UPDATE fs_entries SET name = ?, parent = ? WHERE id = ?",
+                target_name,
+                parent,
+                id
+            )
+            .execute(tx.as_mut())
+            .await?;
+        }
+
+        // find all affected child-inodes
+        sqlx::query!(
+            "WITH RECURSIVE children AS (
+                SELECT id, parent
+                  FROM fs_entries
+                  WHERE parent = ?
+
+                UNION ALL
+
+                SELECT e.id, e.parent
+                  FROM fs_entries e
+                  INNER JOIN children c ON e.parent = c.id
+                  WHERE e.id != c.parent
+            )
+            SELECT DISTINCT(id) FROM children;",
+            id
+        )
+        .fetch_all(tx.as_mut())
+        .await?
+        .into_iter()
+        .for_each(|r| {
+            affected_ids.insert(r.id as u64);
+        });
+
+        tx.commit().await?;
+
+        info!(
+            "mv from /{}{} to /{}{}",
+            bucket, source_path, bucket, target_path
+        );
 
         Ok(())
     }

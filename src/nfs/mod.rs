@@ -51,30 +51,11 @@ impl NFSFileSystem for SiaNfsFs {
 
     #[instrument(skip(self))]
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
-        let name = std::str::from_utf8(filename).map_err(|_| NFS3ERR_SERVERFAULT)?;
-        match self
-            .vfs
-            .inode_by_name_parent(name, dirid)
-            .await
-            .map_err(|e| {
-                tracing::error!(err = %e, "lookup failed");
-                NFS3ERR_SERVERFAULT
-            })? {
-            Some(inode) => Ok(inode.id()),
-            None => Err(NFS3ERR_NOENT),
-        }
+        Ok(self.inode_by_dir_name(dirid, filename).await?.id())
     }
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
-        match self
-            .vfs
-            .inode_by_id(id)
-            .await
-            .map_err(|_| NFS3ERR_SERVERFAULT)?
-        {
-            Some(inode) => Ok(to_fattr3(&inode)),
-            None => Err(NFS3ERR_NOENT),
-        }
+        Ok(to_fattr3(&self.inode_by_id(id).await?))
     }
 
     async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
@@ -88,15 +69,9 @@ impl NFSFileSystem for SiaNfsFs {
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
-        let file = match self
-            .vfs
-            .inode_by_id(id)
-            .await
-            .map_err(|_| NFS3ERR_SERVERFAULT)?
-        {
-            Some(Inode::File(file)) => file,
-            Some(Inode::Directory(_)) => return Err(NFS3ERR_ISDIR),
-            None => return Err(NFS3ERR_NOENT),
+        let file = match self.inode_by_id(id).await? {
+            Inode::File(file) => file,
+            Inode::Directory(_) => return Err(NFS3ERR_ISDIR),
         };
 
         // make sure we don't read beyond eof
@@ -155,16 +130,10 @@ impl NFSFileSystem for SiaNfsFs {
         dirid: fileid3,
         dirname: &filename3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        let name = std::str::from_utf8(dirname).map_err(|_| NFS3ERR_SERVERFAULT)?;
-        let parent = match self
-            .vfs
-            .inode_by_id(dirid)
-            .await
-            .map_err(|_| NFS3ERR_SERVERFAULT)?
-        {
-            Some(Inode::File(_)) => return Err(NFS3ERR_NOTDIR),
-            Some(Inode::Directory(dir)) => dir,
-            None => return Err(NFS3ERR_NOENT),
+        let name = to_str(dirname)?;
+        let parent = match self.inode_by_id(dirid).await? {
+            Inode::File(_) => return Err(NFS3ERR_NOTDIR),
+            Inode::Directory(dir) => dir,
         };
 
         let dir = self
@@ -177,18 +146,7 @@ impl NFSFileSystem for SiaNfsFs {
     }
 
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
-        let name = std::str::from_utf8(filename).map_err(|_| NFS3ERR_SERVERFAULT)?;
-        let inode = match self
-            .vfs
-            .inode_by_name_parent(name, dirid)
-            .await
-            .map_err(|e| {
-                tracing::error!(err = %e, "lookup failed");
-                NFS3ERR_SERVERFAULT
-            })? {
-            Some(inode) => inode,
-            None => return Err(NFS3ERR_NOENT),
-        };
+        let inode = self.inode_by_dir_name(dirid, filename).await?;
 
         self.vfs.rm(&inode).await.map_err(|e| {
             tracing::error!(err = %e, "rm failed");
@@ -205,7 +163,28 @@ impl NFSFileSystem for SiaNfsFs {
         to_dirid: fileid3,
         to_filename: &filename3,
     ) -> Result<(), nfsstat3> {
-        Err(NFS3ERR_NOTSUPP)
+        let source = self.inode_by_dir_name(from_dirid, from_filename).await?;
+        let dest_dir = match self.inode_by_id(to_dirid).await? {
+            Inode::File(_) => return Err(NFS3ERR_NOTDIR),
+            Inode::Directory(dir) => dir,
+        };
+        let to_filename = to_str(to_filename)?;
+        let dest_name = if to_filename == source.name() {
+            // no name change
+            None
+        } else {
+            Some(to_filename.to_string())
+        };
+
+        self.vfs
+            .mv(&source, &dest_dir, dest_name)
+            .await
+            .map_err(|e| {
+                tracing::error!(err = %e, "mv failed");
+                NFS3ERR_SERVERFAULT
+            })?;
+
+        Ok(())
     }
 
     async fn readdir(
@@ -214,15 +193,9 @@ impl NFSFileSystem for SiaNfsFs {
         start_after: fileid3,
         max_entries: usize,
     ) -> Result<ReadDirResult, nfsstat3> {
-        let dir = match self
-            .vfs
-            .inode_by_id(dirid)
-            .await
-            .map_err(|_| NFS3ERR_SERVERFAULT)?
-        {
-            Some(Inode::Directory(dir)) => dir,
-            Some(_) => return Err(NFS3ERR_NOTDIR),
-            None => return Err(NFS3ERR_NOENT),
+        let dir = match self.inode_by_id(dirid).await? {
+            Inode::Directory(dir) => dir,
+            _ => return Err(NFS3ERR_NOTDIR),
         };
 
         let inodes = self
@@ -278,6 +251,39 @@ impl NFSFileSystem for SiaNfsFs {
     }
 }
 
+impl SiaNfsFs {
+    async fn inode_by_id(&self, id: fileid3) -> Result<Inode, nfsstat3> {
+        match self
+            .vfs
+            .inode_by_id(id)
+            .await
+            .map_err(|_| NFS3ERR_SERVERFAULT)?
+        {
+            Some(inode) => Ok(inode),
+            None => Err(NFS3ERR_NOENT),
+        }
+    }
+
+    async fn inode_by_dir_name(
+        &self,
+        dirid: fileid3,
+        filename: &filename3,
+    ) -> Result<Inode, nfsstat3> {
+        let name = to_str(filename)?;
+        match self
+            .vfs
+            .inode_by_name_parent(name, dirid)
+            .await
+            .map_err(|e| {
+                tracing::error!(err = %e, "lookup failed");
+                NFS3ERR_SERVERFAULT
+            })? {
+            Some(inode) => Ok(inode),
+            None => Err(NFS3ERR_NOENT),
+        }
+    }
+}
+
 fn to_fattr3(inode: &Inode) -> fattr3 {
     let size = match inode {
         Inode::Directory(_) => 0,
@@ -313,4 +319,8 @@ fn to_nfsstime(date_time: &DateTime<Utc>) -> nfstime3 {
         seconds: date_time.timestamp() as u32,
         nseconds: date_time.timestamp_subsec_nanos(),
     }
+}
+
+fn to_str(name: &filename3) -> Result<&str, nfsstat3> {
+    Ok(std::str::from_utf8(name).map_err(|_| NFS3ERR_SERVERFAULT)?)
 }
