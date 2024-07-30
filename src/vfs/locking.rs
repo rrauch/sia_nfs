@@ -1,5 +1,6 @@
 use itertools::Itertools;
 use std::cmp::PartialEq;
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -38,25 +39,23 @@ impl LockManager {
 
     pub async fn lock<'a, T: IntoIterator<Item = LockRequest<'a>>>(
         &self,
-        requests: T,
+        reqs: T,
     ) -> anyhow::Result<Vec<LockHolder>> {
-        let mut reqs: HashMap<String, LockRequest> = HashMap::default();
-        requests.into_iter().for_each(|r| {
+        let mut requests: HashMap<String, LockRequest> = HashMap::new();
+        reqs.into_iter().for_each(|r| {
             let path = format!("/{}{}", &r.bucket, &r.path);
-            let mut insert = false;
-            if let Some(existing) = reqs.get_mut(&path) {
-                // replace read locks with write locks if both are requested
-                if r.lock_type == LockType::Write && existing.lock_type == LockType::Read {
-                    insert = true;
+            match requests.entry(path) {
+                Entry::Occupied(mut entry) => {
+                    // replace read locks with write locks if both are present
+                    if r.lock_type == LockType::Write && entry.get().lock_type == LockType::Read {
+                        entry.insert(r);
+                    }
                 }
-            } else {
-                insert = true;
-            }
-            if insert {
-                reqs.insert(path, r);
+                Entry::Vacant(entry) => {
+                    entry.insert(r);
+                }
             }
         });
-        let mut requests = reqs;
 
         let locks = {
             let mut path_locks = self.path_locks.lock().expect("unable to lock path_locks");
