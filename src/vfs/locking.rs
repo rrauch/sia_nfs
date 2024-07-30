@@ -1,3 +1,4 @@
+use anyhow::bail;
 use itertools::Itertools;
 use std::cmp::PartialEq;
 use std::collections::hash_map::Entry;
@@ -76,6 +77,11 @@ impl LockManager {
                 .collect::<BTreeMap<_, _>>()
         };
 
+        let expected = locks.len();
+        if expected == 0 {
+            bail!("no locks requested");
+        }
+
         let res = timeout(self.acquisition_timeout, async move {
             let mut resp = Vec::with_capacity(requests.len());
             for (path, lock) in locks.into_iter() {
@@ -100,7 +106,7 @@ impl LockManager {
         })
         .await?;
 
-        assert!(!res.is_empty(), "lock vector empty after acquisition");
+        assert_eq!(res.len(), expected);
 
         Ok(res)
     }
