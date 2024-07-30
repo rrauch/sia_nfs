@@ -1,3 +1,6 @@
+mod locking;
+
+use crate::vfs::locking::{LockHolder, LockManager, LockRequest, ReadLock};
 use crate::SqlitePool;
 use anyhow::{anyhow, bail, Result};
 use async_recursion::async_recursion;
@@ -16,13 +19,10 @@ use std::io::SeekFrom;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::sync::{
-    OwnedRwLockReadGuard, OwnedRwLockWriteGuard, OwnedSemaphorePermit, RwLock, Semaphore,
-};
-use tokio::task::JoinHandle;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 use tracing::{info, instrument};
 
@@ -34,15 +34,8 @@ pub(crate) struct Vfs {
     root: Directory,
     bucket_ids: BiHashMap<u64, String>,
     buckets: BTreeMap<u64, Directory>,
-    path_locks: Arc<Mutex<HashMap<String, Arc<RwLock<String>>>>>,
     download_limiter: Arc<Semaphore>,
-    lock_gc: JoinHandle<()>,
-}
-
-impl Drop for Vfs {
-    fn drop(&mut self) {
-        self.lock_gc.abort();
-    }
+    lock_manager: LockManager,
 }
 
 impl Vfs {
@@ -185,21 +178,6 @@ impl Vfs {
             })
             .collect::<BTreeMap<_, _>>();
 
-        let path_locks = Arc::new(Mutex::new(HashMap::new()));
-        let lock_gc = {
-            let path_locks = path_locks.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(60)).await;
-                    {
-                        let mut locks = path_locks.lock().expect("unable to get file locks");
-                        // remove all locks currently not held outside this map
-                        locks.retain(|_, lock| Arc::strong_count(lock) > 1)
-                    }
-                }
-            })
-        };
-
         let download_limiter = Arc::new(Semaphore::new(max_concurrent_downloads.get()));
 
         Ok(Self {
@@ -213,9 +191,8 @@ impl Vfs {
             },
             buckets,
             bucket_ids,
-            path_locks,
             download_limiter,
-            lock_gc,
+            lock_manager: LockManager::new(Duration::from_secs(30)),
         })
     }
 
@@ -473,11 +450,10 @@ impl Vfs {
             .await?
             .ok_or(anyhow!("invalid dir"))?;
 
-        let _read_lock = self
+        let _locks = self
+            .lock_manager
             .lock([LockRequest::read(&bucket, &path)])
-            .await?
-            .swap_remove(0)
-            .read()?;
+            .await?;
 
         let mut stream = match self
             .renterd
@@ -615,55 +591,6 @@ impl Vfs {
         Ok(known)
     }
 
-    async fn lock<'a, T: IntoIterator<Item = LockRequest<'a>>>(
-        &self,
-        requests: T,
-    ) -> Result<Vec<LockResponse>> {
-        let mut requests = requests
-            .into_iter()
-            .map(|r| (format!("/{}{}", &r.bucket, &r.path), r))
-            .collect::<HashMap<_, _>>();
-
-        let locks = {
-            let mut path_locks = self.path_locks.lock().expect("unable to lock path_locks");
-            // it's important to sort the paths to avoid deadlocks, hopefully
-            requests
-                .iter()
-                .map(|(path, _)| path)
-                .sorted_unstable()
-                .map(|path| {
-                    (
-                        path.clone(),
-                        path_locks
-                            .entry(path.clone())
-                            .or_insert_with(|| Arc::new(RwLock::new(path.clone())))
-                            .clone(),
-                    )
-                })
-                .collect::<BTreeMap<_, _>>()
-        };
-
-        Ok(timeout(Duration::from_secs(30), async move {
-            let mut resp = Vec::with_capacity(requests.len());
-            for (path, lock) in locks.into_iter() {
-                let req = requests.remove(&path).expect("request for lock is missing");
-                resp.push(match req.lock_type {
-                    LockType::Read => {
-                        tracing::trace!("acquiring read lock for {}", path);
-                        LockResponse::Read(lock.read_owned().await)
-                    }
-
-                    LockType::Write => {
-                        tracing::trace!("acquiring write lock for {}", path);
-                        LockResponse::Write(lock.write_owned().await)
-                    }
-                });
-            }
-            resp
-        })
-        .await?)
-    }
-
     pub async fn read_file(&self, file: &File) -> Result<FileReader> {
         let (bucket, path) = self
             .inode_to_bucket_path(Inode::File(file.clone()))
@@ -671,11 +598,15 @@ impl Vfs {
             .ok_or(anyhow!("invalid file"))?;
 
         // acquire the actual read lock
-        let _read_lock = self
+        let _read_lock = match self
+            .lock_manager
             .lock([LockRequest::read(&bucket, &path)])
             .await?
             .swap_remove(0)
-            .read()?;
+        {
+            LockHolder::Read(read_lock) => read_lock,
+            _ => unreachable!("not a read lock"),
+        };
 
         tracing::trace!("waiting for download permit");
         let _download_permit = timeout(
@@ -722,7 +653,8 @@ impl Vfs {
         let path = format!("{}{}/", parent_path, name);
 
         // lock the paths first
-        let _write_locks = self
+        let _locks = self
+            .lock_manager
             .lock([
                 LockRequest::read(&bucket, &parent_path),
                 LockRequest::write(&bucket, &path),
@@ -779,7 +711,8 @@ impl Vfs {
             .await?
             .ok_or(anyhow!("parent not found"))?;
 
-        let _write_lock = self
+        let _locks = self
+            .lock_manager
             .lock([
                 LockRequest::write(&bucket, &path),
                 LockRequest::read(&bucket, &parent_path),
@@ -922,6 +855,7 @@ impl Vfs {
         let target_path = format!("{}{}{}", target_parent_path, target_name, tail);
 
         let _locks = self
+            .lock_manager
             .lock([
                 LockRequest::read(bucket.as_str(), source_parent_path.as_str()),
                 LockRequest::write(bucket.as_str(), source_path.as_str()),
@@ -1045,7 +979,7 @@ impl Vfs {
 
 pub struct FileReader {
     file: File,
-    _read_lock: OwnedRwLockReadGuard<String>,
+    _read_lock: ReadLock,
     _download_permit: OwnedSemaphorePermit,
     offset: u64,
     size: u64,
@@ -1315,55 +1249,5 @@ impl TryFrom<InodeRecord> for Inode {
             r.parent as u64,
             inode_type,
         ))
-    }
-}
-
-enum LockType {
-    Read,
-    Write,
-}
-
-struct LockRequest<'a> {
-    bucket: &'a str,
-    path: &'a str,
-    lock_type: LockType,
-}
-
-impl<'a> LockRequest<'a> {
-    fn read(bucket: &'a str, path: &'a str) -> Self {
-        LockRequest {
-            bucket,
-            path,
-            lock_type: LockType::Read,
-        }
-    }
-
-    fn write(bucket: &'a str, path: &'a str) -> Self {
-        LockRequest {
-            bucket,
-            path,
-            lock_type: LockType::Write,
-        }
-    }
-}
-
-enum LockResponse {
-    Read(OwnedRwLockReadGuard<String>),
-    Write(OwnedRwLockWriteGuard<String>),
-}
-
-impl LockResponse {
-    fn read(self) -> Result<OwnedRwLockReadGuard<String>> {
-        match self {
-            LockResponse::Read(lock) => Ok(lock),
-            _ => Err(anyhow!("not a read lock")),
-        }
-    }
-
-    fn write(self) -> Result<OwnedRwLockWriteGuard<String>> {
-        match self {
-            LockResponse::Write(lock) => Ok(lock),
-            _ => Err(anyhow!("not a write lock")),
-        }
     }
 }
