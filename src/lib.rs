@@ -9,6 +9,7 @@ use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, Sq
 use sqlx::{ConnectOptions, Pool, Sqlite};
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::log::LevelFilter;
 use tracing::Instrument;
@@ -33,13 +34,18 @@ impl SiaNfs {
 
         let db = db_init(db_path, 20, true).await?;
 
-        let vfs = Vfs::new(renterd, db, buckets, NonZeroUsize::new(25).unwrap()).await?;
+        let vfs = Arc::new(Vfs::new(renterd, db, buckets, NonZeroUsize::new(25).unwrap()).await?);
         //Self::foo(&vfs).await?;
 
         Ok(Self {
             listener: NFSTcpListener::bind(
                 "127.0.0.1:12000",
-                SiaNfsFs::new(vfs, NonZeroUsize::new(5).unwrap(), Duration::from_secs(3)),
+                SiaNfsFs::new(
+                    vfs,
+                    NonZeroUsize::new(5).unwrap(),
+                    Duration::from_secs(3),
+                    Duration::from_secs(5),
+                ),
             )
             .await?,
         })

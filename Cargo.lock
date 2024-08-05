@@ -69,6 +69,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69f7f8c3906b62b754cd5326047894316021dcfe5a194c8ea52bdd94934a3457"
+
+[[package]]
 name = "async-recursion"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1814,6 +1820,7 @@ name = "sia_nfs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-recursion",
  "async-trait",
  "bimap",
@@ -1825,6 +1832,7 @@ dependencies = [
  "renterd_client",
  "sqlx",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "url",

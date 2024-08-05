@@ -6,9 +6,9 @@ use anyhow::{anyhow, bail, Result};
 use async_recursion::async_recursion;
 use bimap::BiHashMap;
 use chrono::{DateTime, Utc};
-use futures::{AsyncRead, AsyncSeek};
+use futures::{AsyncRead, AsyncSeek, AsyncWrite};
 use futures_util::io::Cursor;
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::{AsyncWriteExt, StreamExt, TryStreamExt};
 use itertools::{Either, Itertools};
 use renterd_client::bus::object::RenameMode;
 use renterd_client::Client as RenterdClient;
@@ -22,8 +22,11 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::io::{AsyncWrite as TokioAsyncWrite, DuplexStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::{info, instrument};
 
 const ROOT_ID: u64 = 1;
@@ -636,6 +639,99 @@ impl Vfs {
         })
     }
 
+    pub async fn write_file(
+        self: &Arc<Self>,
+        parent: &Directory,
+        name: String,
+    ) -> Result<FileWriter> {
+        if parent.id() == self.root.id() {
+            bail!("unable to write in root directory");
+        }
+
+        let (bucket, parent_path) = self
+            .inode_to_bucket_path(Inode::Directory(parent.clone()))
+            .await?
+            .ok_or(anyhow!("directory not found"))?;
+
+        if name.ends_with("/") {
+            bail!("invalid name");
+        }
+        let path = format!("{}{}", parent_path, name);
+
+        // lock the paths first
+        let _locks = self
+            .lock_manager
+            .lock([
+                LockRequest::read(&bucket, &parent_path),
+                LockRequest::write(&bucket, &path),
+            ])
+            .await?;
+
+        if let Some(_) = self
+            .inode_by_name_parent(name.as_str(), parent.id())
+            .await?
+        {
+            // an inode with the same name already exists in the parent directory
+            bail!("inode already exists");
+        }
+
+        // Ok, this is a bit of a weird part: we need to know the id of the future file before it's even uploaded!
+        // To achieve this, we do a dummy insert into the `fs_entries` table to get an id, then delete it right away
+        // in the same tx. This is a bit of a hack to effectively reserve an id. Later we do a manual insert using
+        // the id we get now.
+        let reserved_id = {
+            let mut tx = self.db.write().begin().await?;
+            let parent_id = parent.id() as i64;
+            let name = name.clone();
+            let id = sqlx::query!(
+                "INSERT INTO fs_entries (name, parent, entry_type) VALUES (?, ?, 'F')",
+                name,
+                parent_id,
+            )
+            .execute(tx.as_mut())
+            .await?
+            .last_insert_rowid() as u64;
+            {
+                let id = id as i64;
+                let _ = sqlx::query!("DELETE FROM fs_entries where id = ?", id)
+                    .execute(tx.as_mut())
+                    .await?;
+            }
+            tx.commit().await?;
+            id
+        };
+
+        let (tx, rx) = tokio::io::duplex(8192);
+        let rx = rx.compat();
+
+        let upload_task = {
+            let vfs = self.clone();
+            let bucket = bucket.clone();
+            let path = path.clone();
+            tokio::spawn(async move {
+                vfs.renterd
+                    .worker()
+                    .object()
+                    .upload(path, None, Some(bucket), rx)
+                    .await
+            })
+        };
+
+        Ok(FileWriter {
+            id: reserved_id,
+            vfs: self.clone(),
+            _locks,
+            bucket,
+            path,
+            name,
+            parent: parent.id(),
+            upload_task: Some(upload_task),
+            stream: Some(tx),
+            bytes_written: 0,
+            last_modified: Utc::now(),
+        })
+    }
+
     #[instrument(skip(self))]
     pub async fn mkdir(&self, parent: &Directory, name: String) -> Result<Directory> {
         if parent.id() == self.root.id() {
@@ -1044,6 +1140,145 @@ impl Drop for FileReader {
             offset = self.offset,
             "file_reader closed"
         );
+    }
+}
+
+pub(crate) struct FileWriter {
+    id: u64,
+    name: String,
+    parent: u64,
+    bucket: String,
+    path: String,
+    stream: Option<DuplexStream>,
+    _locks: Vec<LockHolder>,
+    upload_task: Option<JoinHandle<std::result::Result<(), renterd_client::Error>>>,
+    vfs: Arc<Vfs>,
+    bytes_written: u64,
+    last_modified: DateTime<Utc>,
+}
+
+impl AsyncWrite for FileWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let result = Pin::new(self.stream()?).poll_write(cx, buf);
+        if let Poll::Ready(Ok(bytes_written)) = &result {
+            self.bytes_written += bytes_written.clone() as u64;
+        }
+        result
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(self.stream()?).poll_flush(cx)
+    }
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let result = Pin::new(self.stream()?).poll_shutdown(cx);
+        if let Poll::Ready(Ok(())) = result {
+            // was properly closed, discard stream
+            let _ = self.stream.take();
+            tracing::debug!("FileWriter for /{}{} closed", self.bucket, self.path);
+        }
+        result
+    }
+}
+
+impl FileWriter {
+    fn stream(&mut self) -> std::io::Result<&mut DuplexStream> {
+        self.stream.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "stream already closed")
+        })
+    }
+
+    pub fn file_id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn parent_id(&self) -> u64 {
+        self.parent
+    }
+
+    pub fn name(&self) -> &str {
+        self.name.as_str()
+    }
+
+    pub fn bucket(&self) -> &str {
+        self.bucket.as_str()
+    }
+
+    pub fn path(&self) -> &str {
+        self.path.as_str()
+    }
+
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+
+    pub fn to_file(&self) -> File {
+        File {
+            id: self.id,
+            parent: self.parent,
+            name: self.name.clone(),
+            size: self.bytes_written,
+            last_modified: self.last_modified,
+        }
+    }
+
+    pub async fn finalize(mut self) -> Result<File> {
+        if self.stream.is_some() {
+            // stream has not been closed yet
+            self.close().await?;
+        }
+
+        // wait for the upload task to finish
+        self.upload_task
+            .take()
+            .expect("JoinHandle went missing")
+            .await??;
+
+        // add the new file to the db using the id we previously "reserved"
+        {
+            let id = self.id as i64;
+            let parent_id = self.parent as i64;
+            let name = self.name.clone();
+            let _ = sqlx::query!(
+                "INSERT INTO fs_entries (id, name, parent, entry_type) VALUES (?, ?, ?, 'F')",
+                id,
+                name,
+                parent_id,
+            )
+            .execute(self.vfs.db.write())
+            .await?;
+        }
+
+        match self
+            .vfs
+            .inode_by_name_parent(&self.name, self.parent)
+            .await?
+        {
+            Some(Inode::File(file)) => Ok(file),
+            _ => Err(anyhow!("uploaded inode invalid")),
+        }
+    }
+}
+
+impl Drop for FileWriter {
+    fn drop(&mut self) {
+        if self.stream.is_some() {
+            tracing::warn!(
+                "FileWriter for /{}{} dropped before closing, data corruption possible!",
+                self.bucket,
+                self.path
+            );
+        }
+        if let Some(upload_task) = self.upload_task.take() {
+            upload_task.abort();
+            tracing::warn!(
+                "upload_task for /{}{} had to be aborted, data corruption possible!",
+                self.bucket,
+                self.path
+            )
+        }
     }
 }
 

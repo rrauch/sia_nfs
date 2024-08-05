@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1.39", features = ["full"] }
+tokio-util = "0.7"
 anyhow = { version = "1.0", features = ["backtrace"] }
 renterd_client = { path = "../renterd_client" }
 chrono = "0.4"
@@ -19,6 +20,7 @@ nfsserve = "0.10"
 url = "2.5"
 async-trait = "0.1"
 async-recursion = "1.1"
+arc-swap = "1.7"
 
 [build-dependencies]
 tokio = { version = "1.39", features = ["full"] }
