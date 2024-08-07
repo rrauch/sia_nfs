@@ -1,5 +1,6 @@
 mod download;
 mod upload;
+mod io;
 
 use crate::nfs::download::DownloadManager;
 use crate::nfs::upload::UploadManager;
