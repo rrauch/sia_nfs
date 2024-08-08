@@ -1,8 +1,8 @@
 mod download;
-mod upload;
 mod io;
+mod upload;
 
-use crate::nfs::download::DownloadManager;
+use crate::nfs::io::{DownloadManager, Downloader};
 use crate::nfs::upload::UploadManager;
 use crate::vfs::{Inode, InodeType, Vfs};
 use anyhow::Result;
@@ -35,8 +35,13 @@ impl SiaNfsFs {
         max_download_idle: Duration,
         max_upload_idle: Duration,
     ) -> Self {
-        let download_manager =
-            DownloadManager::new(vfs.clone(), max_downloads_per_file, max_download_idle);
+        let download_manager = Downloader::new(
+            vfs.clone(),
+            max_download_idle,
+            max_downloads_per_file,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+        );
         let upload_manager = UploadManager::new(vfs.clone(), max_upload_idle);
         Self {
             download_manager,
@@ -95,12 +100,20 @@ impl NFSFileSystem for SiaNfsFs {
         if count == 0 {
             return Ok((vec![], true));
         }
+        let id = Box::new(file.id());
+        self.download_manager.prepare(&id).await.map_err(|e| {
+            tracing::error!(error = %e, "failed to prepare download for file {}", file.id());
+            NFS3ERR_SERVERFAULT
+        })?;
 
         let mut dl = self
             .download_manager
-            .download(&file, offset)
+            .lease(file.id(), offset)
             .await
-            .map_err(|_| NFS3ERR_SERVERFAULT)?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to get download lease for file {}", file.id());
+                NFS3ERR_SERVERFAULT
+            })?;
 
         let mut buf = Vec::with_capacity(count);
         buf.resize(buf.capacity(), 0x00);

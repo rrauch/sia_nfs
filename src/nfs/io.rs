@@ -4,25 +4,48 @@ use arc_swap::ArcSwap;
 use futures_util::stream::FuturesUnordered;
 use futures_util::{AsyncSeekExt, FutureExt, StreamExt};
 use itertools::{Either, Itertools};
-use std::cmp::PartialEq;
+use std::cmp::{min, PartialEq};
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::hash::Hash;
 use std::io::SeekFrom;
 use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use tracing::instrument;
 use uuid::Uuid;
 
-struct Downloader {
+pub type DownloadManager = IoManager<Downloader>;
+
+pub(crate) struct Downloader {
     vfs: Arc<Vfs>,
     max_downloads: usize,
     max_wait_for_match: Duration,
+    max_inactivity_for_match: Duration,
 }
 
 impl Downloader {
+    pub(crate) fn new(
+        vfs: Arc<Vfs>,
+        max_idle: Duration,
+        max_downloads: NonZeroUsize,
+        max_wait_for_match: Duration,
+        max_inactivity_for_match: Duration,
+    ) -> IoManager<Self> {
+        let downloader = Downloader {
+            vfs,
+            max_downloads: max_downloads.get(),
+            max_wait_for_match,
+            max_inactivity_for_match,
+        };
+
+        IoManager::new(downloader, max_idle, true)
+    }
+
     async fn file(&self, file_id: u64) -> Result<File> {
         match self.vfs.inode_by_id(file_id).await? {
             Some(Inode::File(file)) => Ok(file),
@@ -37,8 +60,7 @@ impl Downloader {
 
     async fn download(
         &self,
-        entry: Arc<Mutex<Entry<Self>>>,
-        _reservation: Reservation<Downloader>,
+        reservation: Reservation<Downloader>,
         file_id: u64,
         offset: u64,
     ) -> Result<Lease<Downloader>> {
@@ -51,11 +73,17 @@ impl Downloader {
         );
         let mut file_reader = self.vfs.read_file(&file).await?;
         file_reader.seek(SeekFrom::Start(offset)).await?;
-        let mut lock = entry.lock().unwrap();
-        lock.insert_tasks(vec![file_reader]);
-        return Ok(lock
-            .lease(&entry, offset)
-            .ok_or_else(|| anyhow!("unable to get lease for inserted download task!"))?);
+        Ok(reservation.redeem(file_reader)?)
+    }
+
+    fn interested(&self, status: &TasksStatus, offset: u64) -> bool {
+        status
+            .idle_offsets
+            .iter()
+            .chain(status.active_offsets.iter())
+            .chain(status.reserved_offsets.iter())
+            .find(|n| n <= &&offset)
+            .is_some()
     }
 }
 
@@ -68,58 +96,73 @@ impl IoBackend for Downloader {
         Ok((file, vec![]))
     }
 
+    #[instrument(skip(self, entry))]
     async fn lease(&self, entry: Arc<Mutex<Entry<Self>>>, offset: u64) -> Result<Lease<Self>> {
+        let wait_deadline = SystemTime::now() + self.max_wait_for_match;
+        tracing::trace!(wait_deadline = ?wait_deadline, "begin getting lease");
         let (mut watch_rx, file_id) = {
             let lock = entry.lock().unwrap();
-            (lock.task_offset_change_tx.subscribe(), lock.key)
+            (lock.status_tx.subscribe(), lock.key)
         };
-        let wait_deadline = SystemTime::now() + self.max_wait_for_match;
 
-        // try to get a download lease right now
-        {
-            let mut lock = entry.lock().unwrap();
-            if let Some(lease) = lock.lease(&entry, offset) {
-                return Ok(lease);
-            }
-        }
+        // Phase 1: try to wait for a suitable download to resume
+        'outer: while SystemTime::now() < wait_deadline {
+            // check if there are any active downloads or reservations that could become potentially interesting
+            let mut status = {
+                let mut lock = entry.lock().unwrap();
+                let wanted_offset = &offset;
 
-        let mut wait_for_task = false;
-        if SystemTime::now() < wait_deadline {
-            // check if there are any active downloads that could become potentially interesting
-            let lock = entry.lock().unwrap();
-            wait_for_task = lock
-                .tasks
-                .iter()
-                .find(|t| match t {
-                    Task::Active {
-                        previous_offset, ..
-                    } => previous_offset <= &offset,
-                    _ => false,
-                })
-                .is_some();
-        }
+                // first, try to get a lease right now
+                if let Some(lease) = lock.lease(&entry, offset) {
+                    return Ok(lease);
+                }
 
-        if wait_for_task {
-            // we won't wait longer than that
-            while SystemTime::now() < wait_deadline {
-                let sleep_duration = wait_deadline
+                // then get the current status
+                let status = lock.status();
+                // avoid unnecessary work by marking the current state as seen
+                watch_rx.mark_unchanged();
+                status
+            };
+
+            loop {
+                if !self.interested(&status, offset) {
+                    // nothing interesting queued right now
+                    // no need to wait further, start a new download
+                    tracing::trace!("not interested in existing tasks");
+                    break 'outer;
+                }
+
+                let sleep_deadline = match &status.activity {
+                    Activity::Active => wait_deadline,
+                    Activity::Idle(None) => SystemTime::now(),
+                    Activity::Idle(Some(last_activity)) => {
+                        *last_activity + self.max_inactivity_for_match
+                    }
+                };
+                // making sure it doesn't exceed total wait time
+                let sleep_deadline = min(sleep_deadline, wait_deadline);
+
+                let sleep_duration = sleep_deadline
                     .duration_since(SystemTime::now())
-                    .unwrap_or(Duration::from_secs(0));
+                    .unwrap_or_else(|_| Duration::from_secs(0));
 
                 tokio::select! {
-                    _ = tokio::time::sleep(sleep_duration) => {},
+                    _ = tokio::time::sleep(sleep_duration) => {
+                        tracing::trace!("waiting timeout reached");
+                        break 'outer;
+                    },
                     _ = watch_rx.changed() => {
-                        if let Some(candidate_offset) = watch_rx.borrow_and_update().deref().as_ref() {
-                            if candidate_offset == &offset {
-                                // it's a match
-                                break;
-                            }
+                        status = watch_rx.borrow_and_update().clone();
+                        if status.idle_offsets.contains(&offset) {
+                            tracing::trace!("suitable idle task became available");
+                            break;
                         }
                     }
                 }
             }
         }
 
+        // Phase 2: Start a new download
         let mut reservation = None;
 
         loop {
@@ -138,7 +181,7 @@ impl IoBackend for Downloader {
                     // check task capacity first, reserve if still free
                     if lock.tasks.len() < self.max_downloads {
                         // reserve a slot
-                        let reservation = lock.reserve(&entry);
+                        let reservation = lock.make_reservation(&entry, offset);
                         Some(reservation)
                     } else {
                         None
@@ -147,24 +190,29 @@ impl IoBackend for Downloader {
             } {
                 // managed to get a reservation
                 // start a new download
-                return self.download(entry, reservation, file_id, offset).await;
+                return self.download(reservation, file_id, offset).await;
             }
 
-            let mut task_to_finalize = None;
+            let mut freed_task = None;
             // try to remove the oldest idle download
             {
                 let mut lock = entry.lock().unwrap();
                 if lock.tasks.len() >= self.max_downloads {
                     // remove the oldest idle download
-                    task_to_finalize = lock.free_task();
+                    freed_task = lock.free_task();
                 }
                 if lock.tasks.len() < self.max_downloads {
-                    // free seems to have worked
+                    // free_task seems to have worked
                     // get a reservation and try downloading again
-                    reservation = Some(lock.reserve(&entry));
+                    reservation = Some(lock.make_reservation(&entry, offset));
                 }
+
+                // avoid unnecessary work by marking the current state as seen
+                watch_rx.mark_unchanged();
             }
-            if let Some(task) = task_to_finalize.take() {
+            // don't forget to finalize the freed task (if we have one)
+            if let Some(task) = freed_task.take() {
+                tracing::trace!("finalizing freed task");
                 task.finalize().await?;
             }
 
@@ -176,29 +224,14 @@ impl IoBackend for Downloader {
     }
 }
 
-impl IoManager<Downloader> {
-    pub(crate) fn new_downloader(
-        vfs: Arc<Vfs>,
-        max_idle: Duration,
-        max_downloads: NonZeroUsize,
-        max_wait_for_match: Duration,
-    ) -> Self {
-        IoManager {
-            vfs: vfs.clone(),
-            backend: Downloader {
-                vfs,
-                max_downloads: max_downloads.get(),
-                max_wait_for_match,
-            },
-            active: Arc::new(Mutex::new(HashMap::new())),
-            max_idle,
-            allow_prepare_existing: true,
-        }
-    }
-}
-
 struct Uploader {
     vfs: Arc<Vfs>,
+}
+
+impl Uploader {
+    pub(crate) fn new(vfs: Arc<Vfs>, max_idle: Duration) -> IoManager<Self> {
+        IoManager::new(Uploader { vfs }, max_idle, false)
+    }
 }
 
 impl IoBackend for Uploader {
@@ -223,7 +256,7 @@ impl IoBackend for Uploader {
     }
 
     async fn lease(&self, entry: Arc<Mutex<Entry<Self>>>, offset: u64) -> Result<Lease<Self>> {
-        let mut watch_rx = { entry.lock().unwrap().task_offset_change_tx.subscribe() };
+        let mut watch_rx = { entry.lock().unwrap().status_tx.subscribe() };
         loop {
             // try to get one right now
             {
@@ -234,31 +267,14 @@ impl IoBackend for Uploader {
             }
 
             // wait for an update with the exact offset
-            while watch_rx
-                .borrow_and_update()
-                .as_ref()
-                .map_or(true, |&u| u != offset)
-            {
+            while !watch_rx.borrow_and_update().idle_offsets.contains(&offset) {
                 watch_rx.changed().await?;
             }
         }
     }
 }
 
-impl IoManager<Uploader> {
-    pub(crate) fn new_uploader(vfs: Arc<Vfs>, max_idle: Duration) -> Self {
-        IoManager {
-            vfs: vfs.clone(),
-            backend: Uploader { vfs },
-            active: Arc::new(Mutex::new(HashMap::new())),
-            max_idle,
-            allow_prepare_existing: false,
-        }
-    }
-}
-
 pub(crate) struct IoManager<B: IoBackend> {
-    vfs: Arc<Vfs>,
     backend: B,
     active: Arc<
         Mutex<
@@ -274,9 +290,97 @@ pub(crate) struct IoManager<B: IoBackend> {
     >,
     max_idle: Duration,
     allow_prepare_existing: bool,
+    notify_reaper: Arc<Notify>,
+    reaper: JoinHandle<()>,
 }
 
-impl<B: IoBackend> IoManager<B> {
+impl<B: IoBackend + 'static + Sync> IoManager<B> {
+    pub(crate) fn new(backend: B, max_idle: Duration, allow_prepare_existing: bool) -> Self {
+        let notify_reaper = Arc::new(Notify::new());
+        // its unclear why the type cannot be inferred here correctly
+        // with the manual type annotation it works though
+        let active: Arc<
+            Mutex<
+                HashMap<
+                    B::Key,
+                    (
+                        Arc<ArcSwap<SystemTime>>,
+                        watch::Receiver<Status>,
+                        Arc<Mutex<Entry<B>>>,
+                    ),
+                >,
+            >,
+        > = Arc::new(Mutex::new(HashMap::new()));
+
+        let reaper = {
+            let notify_reaper = notify_reaper.clone();
+            let active = active.clone();
+            tokio::spawn(async move {
+                loop {
+                    let mut next_check = SystemTime::now() + Duration::from_secs(60);
+                    let mut finalizations = FuturesUnordered::new();
+                    let keys = {
+                        let lock = active.lock().unwrap();
+                        let now = SystemTime::now();
+                        lock.iter()
+                            .filter_map(|(k, (t, _, e))| {
+                                if t.load().as_ref() <= &now {
+                                    // this entry is of interest
+                                    let mut entry = e.lock().unwrap();
+                                    // remove all expired tasks and finalize them
+                                    entry.remove_expired().into_iter().for_each(|t| {
+                                        finalizations.push(t.finalize());
+                                    });
+                                    if entry.is_empty() {
+                                        // ready for reaping
+                                        return Some(k.clone());
+                                    }
+                                }
+                                None
+                            })
+                            .collect::<Vec<_>>()
+                    };
+
+                    while let Some(res) = finalizations.next().await {
+                        if let Err(err) = res {
+                            tracing::error!(error = %err, "error finalizing task");
+                        }
+                    }
+
+                    // remove empty entries and get the next_check time
+                    {
+                        let mut lock = active.lock().unwrap();
+                        lock.retain(|k, _| !keys.contains(k));
+                        for (_, (t, _, _)) in lock.iter() {
+                            let expiration = t.load();
+                            if expiration.as_ref() < &next_check {
+                                next_check = *expiration.as_ref();
+                            }
+                        }
+                    }
+
+                    let sleep_duration = next_check
+                        .duration_since(SystemTime::now())
+                        .unwrap_or(Duration::from_secs(0));
+
+                    tokio::select! {
+                        _ = tokio::time::sleep(sleep_duration) => {},
+                        _ = notify_reaper.notified() => {}
+                    }
+                }
+            })
+        };
+
+        Self {
+            backend,
+            max_idle,
+            allow_prepare_existing,
+            active,
+            notify_reaper,
+            reaper,
+        }
+    }
+
     pub async fn prepare<KR: AsRef<B::Key>>(&self, key: KR) -> Result<File> {
         let key = key.as_ref();
         let fut = {
@@ -295,7 +399,7 @@ impl<B: IoBackend> IoManager<B> {
                         status_rx.changed().await?;
                     }
                 }
-                .boxed_local()
+                .boxed()
             } else {
                 let (status_tx, status_rx) = watch::channel(Status::Preparing);
                 let expiration = Arc::new(ArcSwap::from_pointee(
@@ -305,8 +409,15 @@ impl<B: IoBackend> IoManager<B> {
                     key: key.clone(),
                     tasks: vec![],
                     max_idle: self.max_idle,
-                    task_offset_change_tx: watch::channel(None).0,
+                    status_tx: watch::channel(TasksStatus {
+                        activity: Activity::Idle(None),
+                        idle_offsets: vec![],
+                        active_offsets: vec![],
+                        reserved_offsets: vec![],
+                    })
+                    .0,
                     next_expiration: expiration.clone(),
+                    notify_reaper: self.notify_reaper.clone(),
                 }));
                 lock.insert(key.clone(), (expiration, status_rx, entry.clone()));
                 {
@@ -331,7 +442,7 @@ impl<B: IoBackend> IoManager<B> {
                         let _ = status_tx.send(Status::Ready(file.clone()));
                         Ok::<File, anyhow::Error>(file)
                     }
-                    .boxed_local()
+                    .boxed()
                 }
             }
         };
@@ -400,12 +511,33 @@ impl<B: IoBackend> IoManager<B> {
     }
 }
 
+impl<B: IoBackend> Drop for IoManager<B> {
+    fn drop(&mut self) {
+        self.reaper.abort();
+    }
+}
+
 pub(crate) struct Entry<B: IoBackend> {
     key: B::Key,
     tasks: Vec<Task<B::Task>>,
     max_idle: Duration,
-    task_offset_change_tx: watch::Sender<Option<u64>>,
+    status_tx: watch::Sender<TasksStatus>,
     next_expiration: Arc<ArcSwap<SystemTime>>,
+    notify_reaper: Arc<Notify>,
+}
+
+#[derive(Clone, Debug)]
+enum Activity {
+    Active,
+    Idle(Option<SystemTime>),
+}
+
+#[derive(Clone, Debug)]
+struct TasksStatus {
+    activity: Activity,
+    idle_offsets: Vec<u64>,
+    active_offsets: Vec<u64>,
+    reserved_offsets: Vec<u64>,
 }
 
 #[derive(PartialEq, Clone)]
@@ -417,6 +549,55 @@ pub(crate) enum Status {
 impl<B: IoBackend> Entry<B> {
     fn is_empty(&self) -> bool {
         self.tasks.is_empty()
+    }
+
+    fn status(&self) -> TasksStatus {
+        let activity = {
+            if self
+                .tasks
+                .iter()
+                .find(|t| match t {
+                    Task::Active { .. } => true,
+                    Task::Reserved { .. } => true,
+                    _ => false,
+                })
+                .is_some()
+            {
+                // currently active
+                Activity::Active
+            } else {
+                let last_idle = self
+                    .tasks
+                    .iter()
+                    .filter_map(|t| match t {
+                        Task::Idle { idle_since, .. } => Some(idle_since),
+                        _ => None,
+                    })
+                    .max()
+                    .map(|t| *t);
+
+                Activity::Idle(last_idle)
+            }
+        };
+
+        let mut idle_offsets = vec![];
+        let mut active_offsets = vec![];
+        let mut reserved_offsets = vec![];
+
+        self.tasks.iter().for_each(|t| match t {
+            Task::Idle { offset, .. } => idle_offsets.push(*offset),
+            Task::Reserved { offset, .. } => reserved_offsets.push(*offset),
+            Task::Active {
+                previous_offset, ..
+            } => active_offsets.push(*previous_offset),
+        });
+
+        TasksStatus {
+            activity,
+            idle_offsets,
+            active_offsets,
+            reserved_offsets,
+        }
     }
 
     fn remove_expired(&mut self) -> Vec<B::Task> {
@@ -438,6 +619,7 @@ impl<B: IoBackend> Entry<B> {
             .collect::<Vec<_>>();
 
         if !expired.is_empty() {
+            let _ = self.status_tx.send(self.status());
             self.update_expiration();
         }
 
@@ -453,22 +635,9 @@ impl<B: IoBackend> Entry<B> {
             .unwrap_or_else(|| SystemTime::now());
 
         if self.next_expiration.load().as_ref() != &next_expiration {
-            self.next_expiration.store(Arc::new(next_expiration))
-            //todo: notify
+            self.next_expiration.store(Arc::new(next_expiration));
+            self.notify_reaper.notify_one();
         }
-    }
-
-    fn remove_lease(&mut self, id: Uuid) {
-        self.tasks = std::mem::take(&mut self.tasks)
-            .into_iter()
-            .filter(|t| {
-                if let Task::Active { lease_id, .. } = t {
-                    lease_id != &id
-                } else {
-                    true
-                }
-            })
-            .collect::<Vec<_>>();
     }
 
     fn return_lease(&mut self, id: Uuid, task: B::Task) {
@@ -481,6 +650,7 @@ impl<B: IoBackend> Entry<B> {
                 *t = Task::Idle {
                     offset: task.offset(),
                     expiration: SystemTime::now() + self.max_idle,
+                    idle_since: SystemTime::now(),
                     task,
                 }
             }
@@ -488,8 +658,9 @@ impl<B: IoBackend> Entry<B> {
                 tracing::error!("unable to return lease {}", id);
             }
         }
+        tracing::trace!(key = ?self.key, offset = offset, lease_id = %id, "lease returned");
         self.update_expiration();
-        let _ = self.task_offset_change_tx.send(offset);
+        let _ = self.status_tx.send(self.status());
     }
 
     fn insert_tasks(&mut self, tasks: Vec<B::Task>) {
@@ -498,33 +669,78 @@ impl<B: IoBackend> Entry<B> {
             self.tasks.push(Task::Idle {
                 offset: task.offset(),
                 expiration: SystemTime::now() + self.max_idle,
+                idle_since: SystemTime::now(),
                 task,
             });
-            let _ = self.task_offset_change_tx.send(offset);
+            let _ = self.status_tx.send(self.status());
         }
         self.update_expiration();
     }
 
-    fn reserve(&mut self, entry: &Arc<Mutex<Entry<B>>>) -> Reservation<B> {
+    fn make_reservation(&mut self, entry: &Arc<Mutex<Entry<B>>>, offset: u64) -> Reservation<B> {
         let reservation_id = Uuid::new_v4();
-        self.tasks.push(Task::Reserved { reservation_id });
+        self.tasks.push(Task::Reserved {
+            offset,
+            reservation_id,
+        });
+        let _ = self.status_tx.send(self.status());
+        tracing::trace!(key = ?self.key, offset = offset, reservation_id = %reservation_id, "new reservation");
         Reservation {
+            return_on_drop: true,
             entry: entry.clone(),
             reservation_id,
         }
     }
 
+    fn redeem_reservation(
+        &mut self,
+        id: Uuid,
+        entry: &Arc<Mutex<Entry<B>>>,
+        task: B::Task,
+    ) -> Result<Lease<B>> {
+        match self.tasks.iter_mut().find(|task| match task {
+            Task::Reserved { reservation_id, .. } => &id == reservation_id,
+            _ => false,
+        }) {
+            Some(t) => {
+                *t = Task::Active {
+                    previous_offset: task.offset(),
+                    lease_id: id,
+                }
+            }
+            None => {
+                bail!("reservation not found");
+            }
+        }
+        tracing::trace!(key = ?self.key, offset = task.offset(), lease_id = %id, "reservation redeemed");
+        Ok(Lease {
+            lease_id: id,
+            entry: entry.clone(),
+            backend_task: Some(task),
+        })
+    }
+
     fn return_reservation(&mut self, id: Uuid) {
+        let mut found = false;
         self.tasks = std::mem::take(&mut self.tasks)
             .into_iter()
             .filter(|t| {
                 if let Task::Reserved { reservation_id, .. } = t {
-                    reservation_id != &id
+                    if reservation_id == &id {
+                        found = true;
+                        false
+                    } else {
+                        true
+                    }
                 } else {
                     true
                 }
             })
             .collect::<Vec<_>>();
+        tracing::trace!(key = ?self.key, reservation_id = %id, "unused reservation returned");
+        if found {
+            let _ = self.status_tx.send(self.status());
+        }
     }
 
     /// Attempts to remove the oldest idle task
@@ -534,16 +750,20 @@ impl<B: IoBackend> Entry<B> {
             .iter()
             .enumerate()
             .filter_map(|(index, task)| {
-                if let Task::Idle { expiration, .. } = task {
-                    Some((index, expiration))
+                if let Task::Idle { idle_since, .. } = task {
+                    Some((index, idle_since))
                 } else {
                     None
                 }
             })
-            .min_by_key(|&(_, expiration)| expiration)
+            .min_by_key(|&(_, idle_since)| idle_since)
         {
             Some(match self.tasks.swap_remove(index) {
-                Task::Idle { task, .. } => task,
+                Task::Idle { task, .. } => {
+                    let _ = self.status_tx.send(self.status());
+                    tracing::trace!("task {} freed", task.offset());
+                    task
+                }
                 _ => unreachable!(),
             })
         } else {
@@ -571,6 +791,8 @@ impl<B: IoBackend> Entry<B> {
                 if offset != wanted_offset {
                     panic!("invalid offset in task: {} != {}", wanted_offset, offset);
                 }
+                tracing::trace!(key = ?self.key, offset = offset, lease_id = %uuid, "new lease");
+                let _ = self.status_tx.send(self.status());
                 self.update_expiration();
                 Some(Lease {
                     entry: entry.clone(),
@@ -589,6 +811,7 @@ enum Task<BT: IoBackendTask> {
     Idle {
         offset: u64,
         expiration: SystemTime,
+        idle_since: SystemTime,
         task: BT,
     },
     Active {
@@ -596,6 +819,7 @@ enum Task<BT: IoBackendTask> {
         previous_offset: u64,
     },
     Reserved {
+        offset: u64,
         reservation_id: Uuid,
     },
 }
@@ -619,12 +843,23 @@ impl<BT: IoBackendTask> Task<BT> {
 struct Reservation<B: IoBackend> {
     entry: Arc<Mutex<Entry<B>>>,
     reservation_id: Uuid,
+    return_on_drop: bool,
+}
+
+impl<B: IoBackend> Reservation<B> {
+    pub fn redeem(mut self, task: B::Task) -> Result<Lease<B>> {
+        self.return_on_drop = false;
+        let mut lock = self.entry.lock().unwrap();
+        lock.redeem_reservation(self.reservation_id, &self.entry, task)
+    }
 }
 
 impl<B: IoBackend> Drop for Reservation<B> {
     fn drop(&mut self) {
-        let mut lock = self.entry.lock().unwrap();
-        lock.return_reservation(self.reservation_id);
+        if self.return_on_drop {
+            let mut lock = self.entry.lock().unwrap();
+            lock.return_reservation(self.reservation_id);
+        }
     }
 }
 
@@ -659,15 +894,18 @@ impl<B: IoBackend> DerefMut for Lease<B> {
 
 pub(crate) trait IoBackend: Sized {
     type Task: IoBackendTask;
-    type Key: Hash + Eq + Clone;
+    type Key: Hash + Eq + Clone + Send + 'static + Sync + Debug;
 
-    async fn begin(&self, key: &Self::Key) -> Result<(File, Vec<Self::Task>)>;
+    fn begin(
+        &self,
+        key: &Self::Key,
+    ) -> impl std::future::Future<Output = Result<(File, Vec<Self::Task>)>> + Send;
     async fn lease(&self, entry: Arc<Mutex<Entry<Self>>>, offset: u64) -> Result<Lease<Self>>;
 }
 
-pub(crate) trait IoBackendTask {
+pub(crate) trait IoBackendTask: Send {
     fn offset(&self) -> u64;
-    async fn finalize(self) -> Result<File>;
+    fn finalize(self) -> impl std::future::Future<Output = Result<()>> + Send;
 }
 
 impl IoBackendTask for FileReader {
@@ -675,8 +913,8 @@ impl IoBackendTask for FileReader {
         self.offset()
     }
 
-    async fn finalize(self) -> Result<File> {
-        Ok(self.file().clone())
+    async fn finalize(self) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -685,7 +923,8 @@ impl IoBackendTask for FileWriter {
         self.bytes_written()
     }
 
-    async fn finalize(self) -> Result<File> {
-        self.finalize().await
+    async fn finalize(self) -> Result<()> {
+        let _ = self.finalize().await?;
+        Ok(())
     }
 }
