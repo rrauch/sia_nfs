@@ -1,5 +1,6 @@
 mod nfs;
 mod vfs;
+mod io_scheduler;
 
 use crate::nfs::SiaNfsFs;
 use crate::vfs::Vfs;

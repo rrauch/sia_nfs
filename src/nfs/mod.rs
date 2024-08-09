@@ -1,17 +1,13 @@
-mod download;
-mod io;
-mod upload;
-
-use crate::nfs::io::{DownloadManager, Downloader};
-use crate::nfs::upload::UploadManager;
+use crate::io_scheduler::download::Download;
+use crate::io_scheduler::upload::Upload;
+use crate::io_scheduler::Scheduler;
 use crate::vfs::{Inode, InodeType, Vfs};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures_util::{AsyncReadExt, AsyncWriteExt};
 use nfsserve::nfs::nfsstat3::{
-    NFS3ERR_IO, NFS3ERR_ISDIR, NFS3ERR_JUKEBOX, NFS3ERR_NOENT, NFS3ERR_NOTDIR, NFS3ERR_NOTSUPP,
-    NFS3ERR_SERVERFAULT,
+    NFS3ERR_IO, NFS3ERR_ISDIR, NFS3ERR_NOENT, NFS3ERR_NOTDIR, NFS3ERR_NOTSUPP, NFS3ERR_SERVERFAULT,
 };
 use nfsserve::nfs::{
     fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3,
@@ -24,8 +20,8 @@ use tracing::instrument;
 
 pub(crate) struct SiaNfsFs {
     vfs: Arc<Vfs>,
-    download_manager: DownloadManager,
-    upload_manager: UploadManager,
+    downloader: Scheduler<Download>,
+    uploader: Scheduler<Upload>,
 }
 
 impl SiaNfsFs {
@@ -35,17 +31,17 @@ impl SiaNfsFs {
         max_download_idle: Duration,
         max_upload_idle: Duration,
     ) -> Self {
-        let download_manager = Downloader::new(
+        let downloader = Download::new(
             vfs.clone(),
             max_download_idle,
             max_downloads_per_file,
             Duration::from_secs(1),
             Duration::from_millis(100),
         );
-        let upload_manager = UploadManager::new(vfs.clone(), max_upload_idle);
+        let uploader = Upload::new(vfs.clone(), max_upload_idle);
         Self {
-            download_manager,
-            upload_manager,
+            downloader,
+            uploader,
             vfs,
         }
     }
@@ -101,13 +97,13 @@ impl NFSFileSystem for SiaNfsFs {
             return Ok((vec![], true));
         }
         let id = Box::new(file.id());
-        self.download_manager.prepare(&id).await.map_err(|e| {
+        let file = self.downloader.prepare(&id).await.map_err(|e| {
             tracing::error!(error = %e, "failed to prepare download for file {}", file.id());
             NFS3ERR_SERVERFAULT
         })?;
 
         let mut dl = self
-            .download_manager
+            .downloader
             .lease(file.id(), offset)
             .await
             .map_err(|e| {
@@ -131,18 +127,10 @@ impl NFSFileSystem for SiaNfsFs {
             Inode::Directory(_) => return Err(NFS3ERR_ISDIR),
         };
 
-        let mut upload = self
-            .upload_manager
-            .get_upload(&file, offset)
-            .map_err(|e| {
-                tracing::error!(error = %e, "upload not found");
-                NFS3ERR_NOENT
-            })?
-            .await
-            .map_err(|e| {
-                tracing::warn!(error = %e, "error waiting in write queue");
-                NFS3ERR_JUKEBOX // this is supposed to indicate the client should try again in a little while
-            })?;
+        let mut upload = self.uploader.lease(file.id(), offset).await.map_err(|e| {
+            tracing::error!(error = %e, "failed to get upload lease");
+            NFS3ERR_NOENT
+        })?;
 
         upload.write_all(data).await.map_err(|e| {
             tracing::error!(error = %e, "write error");
@@ -151,9 +139,7 @@ impl NFSFileSystem for SiaNfsFs {
 
         tracing::trace!(file = ?file, offset = offset, data = data.len(), "write complete");
 
-        Ok(to_fattr3(&Inode::File(
-            upload.to_file().ok_or(NFS3ERR_SERVERFAULT)?,
-        )))
+        Ok(to_fattr3(&Inode::File(upload.to_file())))
     }
 
     async fn create(
@@ -182,8 +168,8 @@ impl NFSFileSystem for SiaNfsFs {
         };
 
         let file = self
-            .upload_manager
-            .add_upload(&parent, name.to_string())
+            .uploader
+            .prepare(&(parent.id(), name.to_string()))
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "upload_manager error");
@@ -322,16 +308,10 @@ impl NFSFileSystem for SiaNfsFs {
 impl SiaNfsFs {
     async fn inode_by_id(&self, id: fileid3) -> Result<Inode, nfsstat3> {
         // check pending uploads first
-        if let Some(file) = self
-            .upload_manager
-            .pending_file_by_id(id)
-            .await
-            .transpose()
-            .map_err(|e| {
-                tracing::error!(error = %e, "error looking up id in pending list");
-                NFS3ERR_SERVERFAULT
-            })?
-        {
+        if let Some(file) = self.uploader.file_by_id(id).await.map_err(|e| {
+            tracing::error!(error = %e, "error looking up id in upload manager");
+            NFS3ERR_SERVERFAULT
+        })? {
             return Ok(Inode::File(file));
         }
 
@@ -354,10 +334,9 @@ impl SiaNfsFs {
         let name = to_str(filename)?;
         // check pending uploads first
         if let Some(file) = self
-            .upload_manager
-            .pending_file_by_dir_name(dirid, name.to_string())
+            .uploader
+            .file_by_key(&(dirid, name.to_string()))
             .await
-            .transpose()
             .map_err(|e| {
                 tracing::error!(error = %e, "error looking up id in pending list");
                 NFS3ERR_SERVERFAULT

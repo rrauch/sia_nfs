@@ -1,280 +1,26 @@
-use crate::vfs::{File, FileReader, FileWriter, Inode, Vfs};
+use crate::vfs::File;
 use anyhow::{anyhow, bail, Result};
 use arc_swap::ArcSwap;
 use futures_util::stream::FuturesUnordered;
-use futures_util::{AsyncSeekExt, FutureExt, StreamExt};
+use futures_util::FutureExt;
+use futures_util::StreamExt;
 use itertools::{Either, Itertools};
-use std::cmp::{min, PartialEq};
+use std::cmp::max;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::hash::Hash;
-use std::io::SeekFrom;
-use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tokio::sync::{watch, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
-use tracing::instrument;
 use uuid::Uuid;
 
-pub type DownloadManager = IoManager<Downloader>;
+pub(crate) mod download;
+pub(crate) mod upload;
 
-pub(crate) struct Downloader {
-    vfs: Arc<Vfs>,
-    max_downloads: usize,
-    max_wait_for_match: Duration,
-    max_inactivity_for_match: Duration,
-}
-
-impl Downloader {
-    pub(crate) fn new(
-        vfs: Arc<Vfs>,
-        max_idle: Duration,
-        max_downloads: NonZeroUsize,
-        max_wait_for_match: Duration,
-        max_inactivity_for_match: Duration,
-    ) -> IoManager<Self> {
-        let downloader = Downloader {
-            vfs,
-            max_downloads: max_downloads.get(),
-            max_wait_for_match,
-            max_inactivity_for_match,
-        };
-
-        IoManager::new(downloader, max_idle, true)
-    }
-
-    async fn file(&self, file_id: u64) -> Result<File> {
-        match self.vfs.inode_by_id(file_id).await? {
-            Some(Inode::File(file)) => Ok(file),
-            Some(Inode::Directory(_)) => {
-                bail!("expected file but got directory");
-            }
-            None => {
-                bail!("file not found");
-            }
-        }
-    }
-
-    async fn download(
-        &self,
-        reservation: Reservation<Downloader>,
-        file_id: u64,
-        offset: u64,
-    ) -> Result<Lease<Downloader>> {
-        let file = self.file(file_id).await?;
-        tracing::debug!(
-            id = file.id(),
-            name = file.name(),
-            offset,
-            "initiating new download"
-        );
-        let mut file_reader = self.vfs.read_file(&file).await?;
-        file_reader.seek(SeekFrom::Start(offset)).await?;
-        Ok(reservation.redeem(file_reader)?)
-    }
-
-    fn interested(&self, status: &TasksStatus, offset: u64) -> bool {
-        status
-            .idle_offsets
-            .iter()
-            .chain(status.active_offsets.iter())
-            .chain(status.reserved_offsets.iter())
-            .find(|n| n <= &&offset)
-            .is_some()
-    }
-}
-
-impl IoBackend for Downloader {
-    type Task = FileReader;
-    type Key = u64;
-
-    async fn begin(&self, key: &Self::Key) -> Result<(File, Vec<Self::Task>)> {
-        let file = self.file(*key).await?;
-        Ok((file, vec![]))
-    }
-
-    #[instrument(skip(self, entry))]
-    async fn lease(&self, entry: Arc<Mutex<Entry<Self>>>, offset: u64) -> Result<Lease<Self>> {
-        let wait_deadline = SystemTime::now() + self.max_wait_for_match;
-        tracing::trace!(wait_deadline = ?wait_deadline, "begin getting lease");
-        let (mut watch_rx, file_id) = {
-            let lock = entry.lock().unwrap();
-            (lock.status_tx.subscribe(), lock.key)
-        };
-
-        // Phase 1: try to wait for a suitable download to resume
-        'outer: while SystemTime::now() < wait_deadline {
-            // check if there are any active downloads or reservations that could become potentially interesting
-            let mut status = {
-                let mut lock = entry.lock().unwrap();
-                let wanted_offset = &offset;
-
-                // first, try to get a lease right now
-                if let Some(lease) = lock.lease(&entry, offset) {
-                    return Ok(lease);
-                }
-
-                // then get the current status
-                let status = lock.status();
-                // avoid unnecessary work by marking the current state as seen
-                watch_rx.mark_unchanged();
-                status
-            };
-
-            loop {
-                if !self.interested(&status, offset) {
-                    // nothing interesting queued right now
-                    // no need to wait further, start a new download
-                    tracing::trace!("not interested in existing tasks");
-                    break 'outer;
-                }
-
-                let sleep_deadline = match &status.activity {
-                    Activity::Active => wait_deadline,
-                    Activity::Idle(None) => SystemTime::now(),
-                    Activity::Idle(Some(last_activity)) => {
-                        *last_activity + self.max_inactivity_for_match
-                    }
-                };
-                // making sure it doesn't exceed total wait time
-                let sleep_deadline = min(sleep_deadline, wait_deadline);
-
-                let sleep_duration = sleep_deadline
-                    .duration_since(SystemTime::now())
-                    .unwrap_or_else(|_| Duration::from_secs(0));
-
-                tokio::select! {
-                    _ = tokio::time::sleep(sleep_duration) => {
-                        tracing::trace!("waiting timeout reached");
-                        break 'outer;
-                    },
-                    _ = watch_rx.changed() => {
-                        status = watch_rx.borrow_and_update().clone();
-                        if status.idle_offsets.contains(&offset) {
-                            tracing::trace!("suitable idle task became available");
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Phase 2: Start a new download
-        let mut reservation = None;
-
-        loop {
-            // let's see if we hold a reservation
-            if let Some(reservation) = match reservation.take() {
-                // we do, proceed to download attempt
-                Some(reservation) => Some(reservation),
-                // no reservation, try to get one
-                None => {
-                    let mut lock = entry.lock().unwrap();
-                    // first, try again if we can get a lease right away
-                    if let Some(lease) = lock.lease(&entry, offset) {
-                        return Ok(lease);
-                    }
-
-                    // check task capacity first, reserve if still free
-                    if lock.tasks.len() < self.max_downloads {
-                        // reserve a slot
-                        let reservation = lock.make_reservation(&entry, offset);
-                        Some(reservation)
-                    } else {
-                        None
-                    }
-                }
-            } {
-                // managed to get a reservation
-                // start a new download
-                return self.download(reservation, file_id, offset).await;
-            }
-
-            let mut freed_task = None;
-            // try to remove the oldest idle download
-            {
-                let mut lock = entry.lock().unwrap();
-                if lock.tasks.len() >= self.max_downloads {
-                    // remove the oldest idle download
-                    freed_task = lock.free_task();
-                }
-                if lock.tasks.len() < self.max_downloads {
-                    // free_task seems to have worked
-                    // get a reservation and try downloading again
-                    reservation = Some(lock.make_reservation(&entry, offset));
-                }
-
-                // avoid unnecessary work by marking the current state as seen
-                watch_rx.mark_unchanged();
-            }
-            // don't forget to finalize the freed task (if we have one)
-            if let Some(task) = freed_task.take() {
-                tracing::trace!("finalizing freed task");
-                task.finalize().await?;
-            }
-
-            if reservation.is_none() {
-                // everything is busy and full, try again once something changes
-                watch_rx.changed().await?
-            }
-        }
-    }
-}
-
-struct Uploader {
-    vfs: Arc<Vfs>,
-}
-
-impl Uploader {
-    pub(crate) fn new(vfs: Arc<Vfs>, max_idle: Duration) -> IoManager<Self> {
-        IoManager::new(Uploader { vfs }, max_idle, false)
-    }
-}
-
-impl IoBackend for Uploader {
-    type Task = FileWriter;
-    type Key = (u64, String);
-
-    async fn begin(&self, key: &Self::Key) -> Result<(File, Vec<Self::Task>)> {
-        let (parent_id, name) = key;
-        let parent = match self.vfs.inode_by_id(*parent_id).await? {
-            Some(Inode::Directory(dir)) => dir,
-            Some(Inode::File(_)) => {
-                bail!("parent not a directory");
-            }
-            None => {
-                bail!("parent does not exist");
-            }
-        };
-
-        let res = self.vfs.write_file(&parent, name.to_string()).await?;
-        let file = res.to_file();
-        Ok((file, vec![res]))
-    }
-
-    async fn lease(&self, entry: Arc<Mutex<Entry<Self>>>, offset: u64) -> Result<Lease<Self>> {
-        let mut watch_rx = { entry.lock().unwrap().status_tx.subscribe() };
-        loop {
-            // try to get one right now
-            {
-                let mut lock = entry.lock().unwrap();
-                if let Some(lease) = lock.lease(&entry, offset) {
-                    return Ok(lease);
-                }
-            }
-
-            // wait for an update with the exact offset
-            while !watch_rx.borrow_and_update().idle_offsets.contains(&offset) {
-                watch_rx.changed().await?;
-            }
-        }
-    }
-}
-
-pub(crate) struct IoManager<B: IoBackend> {
+pub(crate) struct Scheduler<B: Backend> {
     backend: B,
     active: Arc<
         Mutex<
@@ -294,8 +40,8 @@ pub(crate) struct IoManager<B: IoBackend> {
     reaper: JoinHandle<()>,
 }
 
-impl<B: IoBackend + 'static + Sync> IoManager<B> {
-    pub(crate) fn new(backend: B, max_idle: Duration, allow_prepare_existing: bool) -> Self {
+impl<B: Backend + 'static + Sync> Scheduler<B> {
+    fn new(backend: B, max_idle: Duration, allow_prepare_existing: bool) -> Self {
         let notify_reaper = Arc::new(Notify::new());
         // its unclear why the type cannot be inferred here correctly
         // with the manual type annotation it works though
@@ -318,39 +64,47 @@ impl<B: IoBackend + 'static + Sync> IoManager<B> {
             tokio::spawn(async move {
                 loop {
                     let mut next_check = SystemTime::now() + Duration::from_secs(60);
-                    let mut finalizations = FuturesUnordered::new();
-                    let keys = {
-                        let lock = active.lock().unwrap();
+                    let mut finalizations = {
+                        let mut lock = active.lock().unwrap();
                         let now = SystemTime::now();
-                        lock.iter()
-                            .filter_map(|(k, (t, _, e))| {
+
+                        // once `extract_if` has been stabilized this can be used instead of the following code
+                        // see https://github.com/rust-lang/rust/issues/59618
+                        let keys = lock
+                            .iter()
+                            .filter_map(|(k, (t, s, e))| {
                                 if t.load().as_ref() <= &now {
-                                    // this entry is of interest
-                                    let mut entry = e.lock().unwrap();
-                                    // remove all expired tasks and finalize them
-                                    entry.remove_expired().into_iter().for_each(|t| {
-                                        finalizations.push(t.finalize());
-                                    });
-                                    if entry.is_empty() {
-                                        // ready for reaping
-                                        return Some(k.clone());
+                                    // entry is expired
+                                    if let Status::Ready(_) = s.borrow().deref() {
+                                        if Arc::strong_count(e) == 1 {
+                                            // no one else is holding onto this, ready for reaping
+                                            return Some(k.clone());
+                                        }
                                     }
                                 }
                                 None
                             })
-                            .collect::<Vec<_>>()
+                            .collect::<Vec<_>>();
+
+                        keys.into_iter().filter_map(|key| {
+                            if let Some((_, _, e)) = lock.remove(&key) {
+                                if let Some(entry) = Arc::into_inner(e) {
+                                    if let Ok(entry) = entry.into_inner() {
+                                        return Some(entry.finalize());
+                                    }
+                                }
+                            }
+                            tracing::error!(key = ?key, "unable to properly finalize expired entry");
+                            None
+                        }).collect::<FuturesUnordered<_>>()
                     };
 
-                    while let Some(res) = finalizations.next().await {
-                        if let Err(err) = res {
-                            tracing::error!(error = %err, "error finalizing task");
-                        }
-                    }
+                    // awaiting all finalizations
+                    while let Some(_) = finalizations.next().await {}
 
-                    // remove empty entries and get the next_check time
+                    // update `next_check`
                     {
-                        let mut lock = active.lock().unwrap();
-                        lock.retain(|k, _| !keys.contains(k));
+                        let lock = active.lock().unwrap();
                         for (_, (t, _, _)) in lock.iter() {
                             let expiration = t.load();
                             if expiration.as_ref() < &next_check {
@@ -362,6 +116,9 @@ impl<B: IoBackend + 'static + Sync> IoManager<B> {
                     let sleep_duration = next_check
                         .duration_since(SystemTime::now())
                         .unwrap_or(Duration::from_secs(0));
+
+                    // make sure we don't reap again right away (unless we are notified)
+                    let sleep_duration = max(sleep_duration, Duration::from_millis(100));
 
                     tokio::select! {
                         _ = tokio::time::sleep(sleep_duration) => {},
@@ -381,8 +138,7 @@ impl<B: IoBackend + 'static + Sync> IoManager<B> {
         }
     }
 
-    pub async fn prepare<KR: AsRef<B::Key>>(&self, key: KR) -> Result<File> {
-        let key = key.as_ref();
+    pub async fn prepare(&self, key: &B::Key) -> anyhow::Result<File> {
         let fut = {
             let mut lock = self.active.lock().expect("unable to acquire active lock");
             if lock.contains_key(key) {
@@ -438,7 +194,6 @@ impl<B: IoBackend + 'static + Sync> IoManager<B> {
                             let mut lock = entry.lock().expect("unable to get entry lock");
                             lock.insert_tasks(tasks);
                         }
-
                         let _ = status_tx.send(Status::Ready(file.clone()));
                         Ok::<File, anyhow::Error>(file)
                     }
@@ -459,8 +214,8 @@ impl<B: IoBackend + 'static + Sync> IoManager<B> {
         Ok(timeout(Duration::from_secs(60), backend.lease(entry, offset)).await??)
     }
 
-    pub async fn file_by_key<KR: AsRef<B::Key>>(&self, key: KR) -> Result<Option<File>> {
-        self.file(Either::Right(key.as_ref())).await
+    pub async fn file_by_key(&self, key: &B::Key) -> Result<Option<File>> {
+        self.file(Either::Right(key)).await
     }
 
     pub async fn file_by_id(&self, file_id: u64) -> Result<Option<File>> {
@@ -511,13 +266,13 @@ impl<B: IoBackend + 'static + Sync> IoManager<B> {
     }
 }
 
-impl<B: IoBackend> Drop for IoManager<B> {
+impl<B: Backend> Drop for Scheduler<B> {
     fn drop(&mut self) {
         self.reaper.abort();
     }
 }
 
-pub(crate) struct Entry<B: IoBackend> {
+pub(crate) struct Entry<B: Backend> {
     key: B::Key,
     tasks: Vec<Task<B::Task>>,
     max_idle: Duration,
@@ -546,7 +301,24 @@ pub(crate) enum Status {
     Ready(File),
 }
 
-impl<B: IoBackend> Entry<B> {
+impl<B: Backend> Entry<B> {
+    async fn finalize(self) {
+        let mut finalizers = self
+            .tasks
+            .into_iter()
+            .filter_map(|t| match t {
+                Task::Idle { task, .. } => Some(task.finalize()),
+                _ => None,
+            })
+            .collect::<FuturesUnordered<_>>();
+
+        while let Some(res) = finalizers.next().await {
+            if let Err(err) = res {
+                tracing::error!(error = %err, "error finalizing backend task");
+            }
+        }
+    }
+
     fn is_empty(&self) -> bool {
         self.tasks.is_empty()
     }
@@ -665,7 +437,6 @@ impl<B: IoBackend> Entry<B> {
 
     fn insert_tasks(&mut self, tasks: Vec<B::Task>) {
         for task in tasks {
-            let offset = Some(task.offset());
             self.tasks.push(Task::Idle {
                 offset: task.offset(),
                 expiration: SystemTime::now() + self.max_idle,
@@ -807,7 +578,7 @@ impl<B: IoBackend> Entry<B> {
     }
 }
 
-enum Task<BT: IoBackendTask> {
+enum Task<BT: BackendTask> {
     Idle {
         offset: u64,
         expiration: SystemTime,
@@ -824,7 +595,7 @@ enum Task<BT: IoBackendTask> {
     },
 }
 
-impl<BT: IoBackendTask> Task<BT> {
+impl<BT: BackendTask> Task<BT> {
     fn expiration(&self) -> SystemTime {
         match &self {
             Task::Idle { expiration, .. } => expiration.clone(),
@@ -840,13 +611,13 @@ impl<BT: IoBackendTask> Task<BT> {
     }
 }
 
-struct Reservation<B: IoBackend> {
+struct Reservation<B: Backend> {
     entry: Arc<Mutex<Entry<B>>>,
     reservation_id: Uuid,
     return_on_drop: bool,
 }
 
-impl<B: IoBackend> Reservation<B> {
+impl<B: Backend> Reservation<B> {
     pub fn redeem(mut self, task: B::Task) -> Result<Lease<B>> {
         self.return_on_drop = false;
         let mut lock = self.entry.lock().unwrap();
@@ -854,7 +625,7 @@ impl<B: IoBackend> Reservation<B> {
     }
 }
 
-impl<B: IoBackend> Drop for Reservation<B> {
+impl<B: Backend> Drop for Reservation<B> {
     fn drop(&mut self) {
         if self.return_on_drop {
             let mut lock = self.entry.lock().unwrap();
@@ -863,13 +634,13 @@ impl<B: IoBackend> Drop for Reservation<B> {
     }
 }
 
-pub(crate) struct Lease<B: IoBackend> {
+pub(crate) struct Lease<B: Backend> {
     entry: Arc<Mutex<Entry<B>>>,
     lease_id: Uuid,
     backend_task: Option<B::Task>,
 }
 
-impl<B: IoBackend> Drop for Lease<B> {
+impl<B: Backend> Drop for Lease<B> {
     fn drop(&mut self) {
         if let Some(task) = self.backend_task.take() {
             let mut lock = self.entry.lock().unwrap();
@@ -878,7 +649,7 @@ impl<B: IoBackend> Drop for Lease<B> {
     }
 }
 
-impl<B: IoBackend> Deref for Lease<B> {
+impl<B: Backend> Deref for Lease<B> {
     type Target = B::Task;
 
     fn deref(&self) -> &Self::Target {
@@ -886,14 +657,14 @@ impl<B: IoBackend> Deref for Lease<B> {
     }
 }
 
-impl<B: IoBackend> DerefMut for Lease<B> {
+impl<B: Backend> DerefMut for Lease<B> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.backend_task.as_mut().unwrap()
     }
 }
 
-pub(crate) trait IoBackend: Sized {
-    type Task: IoBackendTask;
+pub(crate) trait Backend: Sized {
+    type Task: BackendTask;
     type Key: Hash + Eq + Clone + Send + 'static + Sync + Debug;
 
     fn begin(
@@ -903,28 +674,7 @@ pub(crate) trait IoBackend: Sized {
     async fn lease(&self, entry: Arc<Mutex<Entry<Self>>>, offset: u64) -> Result<Lease<Self>>;
 }
 
-pub(crate) trait IoBackendTask: Send {
+pub(crate) trait BackendTask: Send {
     fn offset(&self) -> u64;
     fn finalize(self) -> impl std::future::Future<Output = Result<()>> + Send;
-}
-
-impl IoBackendTask for FileReader {
-    fn offset(&self) -> u64 {
-        self.offset()
-    }
-
-    async fn finalize(self) -> Result<()> {
-        Ok(())
-    }
-}
-
-impl IoBackendTask for FileWriter {
-    fn offset(&self) -> u64 {
-        self.bytes_written()
-    }
-
-    async fn finalize(self) -> Result<()> {
-        let _ = self.finalize().await?;
-        Ok(())
-    }
 }
