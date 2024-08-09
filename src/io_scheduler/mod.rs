@@ -15,7 +15,6 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::{watch, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
-use uuid::Uuid;
 
 pub(crate) mod download;
 pub(crate) mod upload;
@@ -43,88 +42,13 @@ pub(crate) struct Scheduler<B: Backend> {
 impl<B: Backend + 'static + Sync> Scheduler<B> {
     fn new(backend: B, max_idle: Duration, allow_prepare_existing: bool) -> Self {
         let notify_reaper = Arc::new(Notify::new());
-        // its unclear why the type cannot be inferred here correctly
-        // with the manual type annotation it works though
-        let active: Arc<
-            Mutex<
-                HashMap<
-                    B::Key,
-                    (
-                        Arc<ArcSwap<SystemTime>>,
-                        watch::Receiver<Status>,
-                        Arc<Mutex<Entry<B>>>,
-                    ),
-                >,
-            >,
-        > = Arc::new(Mutex::new(HashMap::new()));
+        let active = Arc::new(Mutex::new(HashMap::new()));
 
         let reaper = {
             let notify_reaper = notify_reaper.clone();
             let active = active.clone();
             tokio::spawn(async move {
-                loop {
-                    let mut next_check = SystemTime::now() + Duration::from_secs(60);
-                    let mut finalizations = {
-                        let mut lock = active.lock().unwrap();
-                        let now = SystemTime::now();
-
-                        // once `extract_if` has been stabilized this can be used instead of the following code
-                        // see https://github.com/rust-lang/rust/issues/59618
-                        let keys = lock
-                            .iter()
-                            .filter_map(|(k, (t, s, e))| {
-                                if t.load().as_ref() <= &now {
-                                    // entry is expired
-                                    if let Status::Ready(_) = s.borrow().deref() {
-                                        if Arc::strong_count(e) == 1 {
-                                            // no one else is holding onto this, ready for reaping
-                                            return Some(k.clone());
-                                        }
-                                    }
-                                }
-                                None
-                            })
-                            .collect::<Vec<_>>();
-
-                        keys.into_iter().filter_map(|key| {
-                            if let Some((_, _, e)) = lock.remove(&key) {
-                                if let Some(entry) = Arc::into_inner(e) {
-                                    if let Ok(entry) = entry.into_inner() {
-                                        return Some(entry.finalize());
-                                    }
-                                }
-                            }
-                            tracing::error!(key = ?key, "unable to properly finalize expired entry");
-                            None
-                        }).collect::<FuturesUnordered<_>>()
-                    };
-
-                    // awaiting all finalizations
-                    while let Some(_) = finalizations.next().await {}
-
-                    // update `next_check`
-                    {
-                        let lock = active.lock().unwrap();
-                        for (_, (t, _, _)) in lock.iter() {
-                            let expiration = t.load();
-                            if expiration.as_ref() < &next_check {
-                                next_check = *expiration.as_ref();
-                            }
-                        }
-                    }
-
-                    let sleep_duration = next_check
-                        .duration_since(SystemTime::now())
-                        .unwrap_or(Duration::from_secs(0));
-
-                    // make sure we don't reap again right away (unless we are notified)
-                    let sleep_duration = max(sleep_duration, Duration::from_millis(100));
-
-                    tokio::select! {
-                        _ = tokio::time::sleep(sleep_duration) => {},
-                        _ = notify_reaper.notified() => {}
-                    }
-                }
+                Self::reap(notify_reaper, active).await;
             })
         };
 
@@ -135,6 +59,87 @@ impl<B: Backend + 'static + Sync> Scheduler<B> {
             active,
             notify_reaper,
             reaper,
+        }
+    }
+
+    async fn reap(
+        notify_reaper: Arc<Notify>,
+        active: Arc<
+            Mutex<
+                HashMap<
+                    B::Key,
+                    (
+                        Arc<ArcSwap<SystemTime>>,
+                        watch::Receiver<Status>,
+                        Arc<Mutex<Entry<B>>>,
+                    ),
+                >,
+            >,
+        >,
+    ) {
+        loop {
+            let mut next_check = SystemTime::now() + Duration::from_secs(60);
+            let mut finalizations =
+                {
+                    let mut lock = active.lock().unwrap();
+                    let now = SystemTime::now();
+
+                    // once `extract_if` has been stabilized this can be used instead of the following code
+                    // see https://github.com/rust-lang/rust/issues/59618
+                    let keys = lock
+                        .iter()
+                        .filter_map(|(k, (t, s, e))| {
+                            if t.load().as_ref() <= &now {
+                                // entry is expired
+                                if let Status::Ready(_) = s.borrow().deref() {
+                                    if Arc::strong_count(e) == 1 {
+                                        // no one else is holding onto this, ready for reaping
+                                        return Some(k.clone());
+                                    }
+                                }
+                            }
+                            None
+                        })
+                        .collect::<Vec<_>>();
+
+                    keys.into_iter().filter_map(|key| {
+                    if let Some((_, _, e)) = lock.remove(&key) {
+                        if let Some(entry) = Arc::into_inner(e) {
+                            if let Ok(entry) = entry.into_inner() {
+                                return Some(entry.finalize());
+                            }
+                        }
+                    }
+                    tracing::error!(key = ?key, "unable to properly finalize expired entry");
+                    None
+                }).collect::<FuturesUnordered<_>>()
+                };
+
+            // awaiting all finalizations
+            while let Some(_) = finalizations.next().await {}
+
+            // update `next_check`
+            {
+                let lock = active.lock().unwrap();
+                for (_, (t, _, _)) in lock.iter() {
+                    let expiration = t.load();
+                    if expiration.as_ref() < &next_check {
+                        next_check = *expiration.as_ref();
+                    }
+                }
+            }
+
+            let sleep_duration = next_check
+                .duration_since(SystemTime::now())
+                .unwrap_or(Duration::from_secs(0));
+
+            // make sure we don't reap again right away (unless we are notified)
+            let sleep_duration = max(sleep_duration, Duration::from_millis(100));
+
+            tokio::select! {
+                _ = tokio::time::sleep(sleep_duration) => {},
+                _ = notify_reaper.notified() => {}
+            }
         }
     }
 
@@ -359,9 +364,7 @@ impl<B: Backend> Entry<B> {
         self.tasks.iter().for_each(|t| match t {
             Task::Idle { offset, .. } => idle_offsets.push(*offset),
             Task::Reserved { offset, .. } => reserved_offsets.push(*offset),
-            Task::Active {
-                previous_offset, ..
-            } => active_offsets.push(*previous_offset),
+            Task::Active { initial_offset, .. } => active_offsets.push(*initial_offset),
         });
 
         TasksStatus {
@@ -412,10 +415,14 @@ impl<B: Backend> Entry<B> {
         }
     }
 
-    fn return_lease(&mut self, id: Uuid, task: B::Task) {
-        let offset = Some(task.offset());
+    fn return_lease(&mut self, initial_offset: u64, task: B::Task) {
+        let end_offset = task.offset();
+        let bytes_processed = task.offset() - initial_offset;
         match self.tasks.iter_mut().find(|task| match task {
-            Task::Active { lease_id, .. } => &id == lease_id,
+            Task::Active {
+                initial_offset: task_offset,
+                ..
+            } => task_offset == &initial_offset,
             _ => false,
         }) {
             Some(t) => {
@@ -427,10 +434,10 @@ impl<B: Backend> Entry<B> {
                 }
             }
             None => {
-                tracing::error!("unable to return lease {}", id);
+                tracing::error!("unable to return lease {}", initial_offset);
             }
         }
-        tracing::trace!(key = ?self.key, offset = offset, lease_id = %id, "lease returned");
+        tracing::trace!(key = ?self.key, initial_offset, end_offset, bytes_processed, "lease returned");
         self.update_expiration();
         let _ = self.status_tx.send(self.status());
     }
@@ -449,55 +456,57 @@ impl<B: Backend> Entry<B> {
     }
 
     fn make_reservation(&mut self, entry: &Arc<Mutex<Entry<B>>>, offset: u64) -> Reservation<B> {
-        let reservation_id = Uuid::new_v4();
-        self.tasks.push(Task::Reserved {
-            offset,
-            reservation_id,
-        });
+        self.tasks.push(Task::Reserved { offset });
         let _ = self.status_tx.send(self.status());
-        tracing::trace!(key = ?self.key, offset = offset, reservation_id = %reservation_id, "new reservation");
+        tracing::trace!(key = ?self.key, offset = offset, "new reservation");
         Reservation {
             return_on_drop: true,
             entry: entry.clone(),
-            reservation_id,
+            offset,
         }
     }
 
     fn redeem_reservation(
         &mut self,
-        id: Uuid,
+        offset: u64,
         entry: &Arc<Mutex<Entry<B>>>,
         task: B::Task,
     ) -> Result<Lease<B>> {
         match self.tasks.iter_mut().find(|task| match task {
-            Task::Reserved { reservation_id, .. } => &id == reservation_id,
+            Task::Reserved {
+                offset: task_offset,
+                ..
+            } => &offset == task_offset,
             _ => false,
         }) {
             Some(t) => {
                 *t = Task::Active {
-                    previous_offset: task.offset(),
-                    lease_id: id,
+                    initial_offset: task.offset(),
                 }
             }
             None => {
                 bail!("reservation not found");
             }
         }
-        tracing::trace!(key = ?self.key, offset = task.offset(), lease_id = %id, "reservation redeemed");
+        tracing::trace!(key = ?self.key, offset, "reservation redeemed");
         Ok(Lease {
-            lease_id: id,
             entry: entry.clone(),
+            initial_offset: offset,
             backend_task: Some(task),
         })
     }
 
-    fn return_reservation(&mut self, id: Uuid) {
+    fn return_reservation(&mut self, offset: u64) {
         let mut found = false;
         self.tasks = std::mem::take(&mut self.tasks)
             .into_iter()
             .filter(|t| {
-                if let Task::Reserved { reservation_id, .. } = t {
-                    if reservation_id == &id {
+                if let Task::Reserved {
+                    offset: task_offset,
+                    ..
+                } = t
+                {
+                    if task_offset == &offset {
                         found = true;
                         false
                     } else {
@@ -508,7 +517,7 @@ impl<B: Backend> Entry<B> {
                 }
             })
             .collect::<Vec<_>>();
-        tracing::trace!(key = ?self.key, reservation_id = %id, "unused reservation returned");
+        tracing::trace!(key = ?self.key, offset, "unused reservation returned");
         if found {
             let _ = self.status_tx.send(self.status());
         }
@@ -550,24 +559,22 @@ impl<B: Backend> Entry<B> {
             _ => false,
         })?;
 
-        let uuid = Uuid::new_v4();
         match std::mem::replace(
             &mut self.tasks[i],
             Task::Active {
-                lease_id: uuid.clone(),
-                previous_offset: offset,
+                initial_offset: offset,
             },
         ) {
             Task::Idle { offset, task, .. } => {
                 if offset != wanted_offset {
                     panic!("invalid offset in task: {} != {}", wanted_offset, offset);
                 }
-                tracing::trace!(key = ?self.key, offset = offset, lease_id = %uuid, "new lease");
+                tracing::trace!(key = ?self.key, offset, "new lease");
                 let _ = self.status_tx.send(self.status());
                 self.update_expiration();
                 Some(Lease {
                     entry: entry.clone(),
-                    lease_id: uuid,
+                    initial_offset: offset,
                     backend_task: Some(task),
                 })
             }
@@ -586,12 +593,10 @@ enum Task<BT: BackendTask> {
         task: BT,
     },
     Active {
-        lease_id: Uuid,
-        previous_offset: u64,
+        initial_offset: u64,
     },
     Reserved {
         offset: u64,
-        reservation_id: Uuid,
     },
 }
 
@@ -613,7 +618,7 @@ impl<BT: BackendTask> Task<BT> {
 
 struct Reservation<B: Backend> {
     entry: Arc<Mutex<Entry<B>>>,
-    reservation_id: Uuid,
+    offset: u64,
     return_on_drop: bool,
 }
 
@@ -621,7 +626,7 @@ impl<B: Backend> Reservation<B> {
     pub fn redeem(mut self, task: B::Task) -> Result<Lease<B>> {
         self.return_on_drop = false;
         let mut lock = self.entry.lock().unwrap();
-        lock.redeem_reservation(self.reservation_id, &self.entry, task)
+        lock.redeem_reservation(self.offset, &self.entry, task)
     }
 }
 
@@ -629,14 +634,14 @@ impl<B: Backend> Drop for Reservation<B> {
     fn drop(&mut self) {
         if self.return_on_drop {
             let mut lock = self.entry.lock().unwrap();
-            lock.return_reservation(self.reservation_id);
+            lock.return_reservation(self.offset);
         }
     }
 }
 
 pub(crate) struct Lease<B: Backend> {
     entry: Arc<Mutex<Entry<B>>>,
-    lease_id: Uuid,
+    initial_offset: u64,
     backend_task: Option<B::Task>,
 }
 
@@ -644,7 +649,7 @@ impl<B: Backend> Drop for Lease<B> {
     fn drop(&mut self) {
         if let Some(task) = self.backend_task.take() {
             let mut lock = self.entry.lock().unwrap();
-            lock.return_lease(self.lease_id, task);
+            lock.return_lease(self.initial_offset, task);
         }
     }
 }

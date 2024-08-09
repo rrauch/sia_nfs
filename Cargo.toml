@@ -21,7 +21,6 @@ url = "2.5"
 async-trait = "0.1"
 async-recursion = "1.1"
 arc-swap = "1.7"
-uuid = { version = "1.10", features = ["v4"] }
 
 [build-dependencies]
 tokio = { version = "1.39", features = ["full"] }
