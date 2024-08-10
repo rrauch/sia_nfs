@@ -681,5 +681,6 @@ pub(crate) trait Backend: Sized {
 
 pub(crate) trait BackendTask: Send {
     fn offset(&self) -> u64;
+    fn can_reuse(&self) -> bool;
     fn finalize(self) -> impl std::future::Future<Output = Result<()>> + Send;
 }

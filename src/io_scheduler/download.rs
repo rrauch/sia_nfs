@@ -228,6 +228,10 @@ impl BackendTask for FileReader {
         self.offset()
     }
 
+    fn can_reuse(&self) -> bool {
+        !self.eof() && self.error_count() == 0
+    }
+
     async fn finalize(self) -> anyhow::Result<()> {
         Ok(())
     }

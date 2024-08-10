@@ -1,4 +1,4 @@
-use crate::io_scheduler::{Entry, Backend, BackendTask, Scheduler, Lease};
+use crate::io_scheduler::{Backend, BackendTask, Entry, Lease, Scheduler};
 use crate::vfs::{File, FileWriter, Inode, Vfs};
 use anyhow::bail;
 use std::sync::{Arc, Mutex};
@@ -61,6 +61,10 @@ impl Backend for Upload {
 impl BackendTask for FileWriter {
     fn offset(&self) -> u64 {
         self.bytes_written()
+    }
+
+    fn can_reuse(&self) -> bool {
+        !self.is_closed() && self.error_count() == 0
     }
 
     async fn finalize(self) -> anyhow::Result<()> {

@@ -636,6 +636,7 @@ impl Vfs {
             stream: Box::new(stream),
             _read_lock,
             _download_permit,
+            error_count: 0,
         })
     }
 
@@ -729,6 +730,7 @@ impl Vfs {
             stream: Some(tx),
             bytes_written: 0,
             last_modified: Utc::now(),
+            error_count: 0,
         })
     }
 
@@ -1080,6 +1082,7 @@ pub struct FileReader {
     offset: u64,
     size: u64,
     stream: Box<dyn ReadStream + Send + Unpin>,
+    error_count: usize,
 }
 
 impl FileReader {
@@ -1098,6 +1101,10 @@ impl FileReader {
     pub fn eof(&self) -> bool {
         self.offset == self.size
     }
+
+    pub fn error_count(&self) -> usize {
+        self.error_count
+    }
 }
 
 trait ReadStream: AsyncRead + AsyncSeek {}
@@ -1110,8 +1117,15 @@ impl AsyncRead for FileReader {
         buf: &mut [u8],
     ) -> Poll<std::io::Result<usize>> {
         let result = Pin::new(&mut self.stream).poll_read(cx, buf);
-        if let Poll::Ready(Ok(bytes_read)) = result {
-            self.offset += bytes_read as u64;
+        if let Poll::Ready(res) = &result {
+            match res {
+                Ok(bytes_read) => {
+                    self.offset += *bytes_read as u64;
+                }
+                Err(_) => {
+                    self.error_count += 1;
+                }
+            }
         }
         result
     }
@@ -1124,8 +1138,15 @@ impl AsyncSeek for FileReader {
         pos: SeekFrom,
     ) -> Poll<std::io::Result<u64>> {
         let result = Pin::new(&mut self.stream).poll_seek(cx, pos);
-        if let Poll::Ready(Ok(position)) = result {
-            self.offset = position;
+        if let Poll::Ready(res) = &result {
+            match res {
+                Ok(position) => {
+                    self.offset = *position;
+                }
+                Err(_) => {
+                    self.error_count += 1;
+                }
+            }
         }
         result
     }
@@ -1155,6 +1176,7 @@ pub(crate) struct FileWriter {
     vfs: Arc<Vfs>,
     bytes_written: u64,
     last_modified: DateTime<Utc>,
+    error_count: usize,
 }
 
 impl AsyncWrite for FileWriter {
@@ -1164,20 +1186,38 @@ impl AsyncWrite for FileWriter {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let result = Pin::new(self.stream()?).poll_write(cx, buf);
-        if let Poll::Ready(Ok(bytes_written)) = &result {
-            self.bytes_written += bytes_written.clone() as u64;
+        if let Poll::Ready(res) = &result {
+            match res {
+                Ok(bytes_written) => {
+                    self.bytes_written += *bytes_written as u64;
+                }
+                Err(_) => {
+                    self.error_count += 1;
+                }
+            }
         }
         result
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(self.stream()?).poll_flush(cx)
+        let result = Pin::new(self.stream()?).poll_flush(cx);
+        if let Poll::Ready(Err(_)) = &result {
+            self.error_count += 1;
+        }
+        result
     }
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let result = Pin::new(self.stream()?).poll_shutdown(cx);
-        if let Poll::Ready(Ok(())) = result {
-            // was properly closed, discard stream
-            let _ = self.stream.take();
-            tracing::debug!("FileWriter for /{}{} closed", self.bucket, self.path);
+        if let Poll::Ready(res) = &result {
+            match res {
+                Ok(()) => {
+                    // was properly closed, discard stream
+                    let _ = self.stream.take();
+                    tracing::debug!("FileWriter for /{}{} closed", self.bucket, self.path);
+                }
+                Err(_) => {
+                    self.error_count += 1;
+                }
+            }
         }
         result
     }
@@ -1214,6 +1254,14 @@ impl FileWriter {
         self.bytes_written
     }
 
+    pub fn error_count(&self) -> usize {
+        self.error_count
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.stream.is_none()
+    }
+
     pub fn to_file(&self) -> File {
         File {
             id: self.id,
@@ -1225,7 +1273,7 @@ impl FileWriter {
     }
 
     pub async fn finalize(mut self) -> Result<File> {
-        if self.stream.is_some() {
+        if !self.is_closed() {
             // stream has not been closed yet
             self.close().await?;
         }
@@ -1264,7 +1312,7 @@ impl FileWriter {
 
 impl Drop for FileWriter {
     fn drop(&mut self) {
-        if self.stream.is_some() {
+        if !self.is_closed() {
             tracing::warn!(
                 "FileWriter for /{}{} dropped before closing, data corruption possible!",
                 self.bucket,
