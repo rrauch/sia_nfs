@@ -1,11 +1,12 @@
 use crate::io_scheduler::BackendTask;
+use crate::vfs::File;
 use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
 use itertools::{Either, Itertools};
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::time::{Duration, SystemTime};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 struct QEntry<BT: BackendTask> {
     offset: u64,
@@ -20,15 +21,8 @@ enum Op<BT: BackendTask> {
     Reserved,
 }
 
-/*struct Status {
-    waiting: Vec<(u64, SystemTime)>,
-    idle: Vec<(u64, SystemTime)>,
-    active: Vec<(u64, SystemTime)>,
-    reserved: Vec<(u64, SystemTime)>,
-}*/
-
 #[derive(Clone)]
-enum Activity {
+pub(super) enum Activity {
     Waiting(u64, SystemTime),
     Idle(u64, SystemTime),
     Active(u64, SystemTime),
@@ -36,7 +30,31 @@ enum Activity {
     Expired(u64, SystemTime),
 }
 
+impl Activity {
+    pub fn timestamp(&self) -> SystemTime {
+        match &self {
+            Activity::Waiting(_, ts) => ts.clone(),
+            Activity::Idle(_, ts) => ts.clone(),
+            Activity::Active(_, ts) => ts.clone(),
+            Activity::Reserved(_, ts) => ts.clone(),
+            Activity::Expired(_, ts) => ts.clone(),
+        }
+    }
+
+    pub fn offset(&self) -> u64 {
+        match &self {
+            Activity::Waiting(offset, _) => offset.clone(),
+            Activity::Idle(offset, _) => offset.clone(),
+            Activity::Active(offset, _) => offset.clone(),
+            Activity::Reserved(offset, _) => offset.clone(),
+            Activity::Expired(offset, _) => offset.clone(),
+        }
+    }
+}
+
 pub(super) struct Queue<BT: BackendTask> {
+    file_tx: watch::Sender<File>,
+    file_rx: watch::Receiver<File>,
     last_activity: SystemTime,
     active: usize,
     max_active: usize, // this includes reserved
@@ -44,19 +62,26 @@ pub(super) struct Queue<BT: BackendTask> {
     queue: HashMap<usize, QEntry<BT>>,
     id_counter: usize,
     activity_tx: broadcast::Sender<Activity>,
+    expiration_tx: watch::Sender<SystemTime>,
 }
 
 impl<BT: BackendTask> Queue<BT> {
     pub(super) fn new(
         max_active: NonZeroUsize,
         max_idle: Duration,
+        initial_expiration: SystemTime,
         initial_tasks: Vec<BT>,
+        file: File,
     ) -> Self {
         let (activity_tx, _) = broadcast::channel(30);
+        let (expiration_tx, _) = watch::channel(initial_expiration);
+        let (file_tx, file_rx) = watch::channel(file);
         let now = SystemTime::now();
         let mut id_counter = 0;
         let mut active = 0;
         Self {
+            file_tx,
+            file_rx,
             last_activity: now,
             max_active: max_active.get(),
             max_idle,
@@ -83,14 +108,15 @@ impl<BT: BackendTask> Queue<BT> {
             id_counter,
             active,
             activity_tx,
+            expiration_tx,
         }
     }
 
-    fn is_active(&self) -> bool {
+    pub(crate) fn is_active(&self) -> bool {
         self.active > 0
     }
 
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
 
@@ -98,35 +124,19 @@ impl<BT: BackendTask> Queue<BT> {
         self.queue.len()
     }
 
-    fn subscribe(&self) -> broadcast::Receiver<Activity> {
+    pub fn activity(&self) -> broadcast::Receiver<Activity> {
         self.activity_tx.subscribe()
     }
 
-    /*fn status(&self) -> Status {
-        let mut waiting = vec![];
-        let mut idle = vec![];
-        let mut active = vec![];
-        let mut reserved = vec![];
+    pub fn expiration(&self) -> watch::Receiver<SystemTime> {
+        self.expiration_tx.subscribe()
+    }
 
-        self.queue.values().for_each(|qe| {
-            let entry = (qe.offset, qe.since);
-            match qe.op {
-                Op::Waiting => waiting.push(entry),
-                Op::Idle(_) => idle.push(entry),
-                Op::Active => active.push(entry),
-                Op::Reserved => reserved.push(entry),
-            }
-        });
+    pub fn file(&self) -> watch::Receiver<File> {
+        self.file_tx.subscribe()
+    }
 
-        Status {
-            waiting,
-            idle,
-            active,
-            reserved,
-        }
-    }*/
-
-    fn last_activity(&self) -> SystemTime {
+    pub fn last_activity(&self) -> SystemTime {
         // if active return the current time
         if self.active > 0 {
             return SystemTime::now();
@@ -134,7 +144,7 @@ impl<BT: BackendTask> Queue<BT> {
         self.last_activity
     }
 
-    fn next_idle_expiration(&self) -> Option<SystemTime> {
+    fn update_expiration(&self) -> Option<SystemTime> {
         let mut expiration = None;
         self.queue.values().for_each(|qe| {
             if let Op::Idle(_) = qe.op {
@@ -151,7 +161,7 @@ impl<BT: BackendTask> Queue<BT> {
         expiration
     }
 
-    fn remove_expired_idle(&mut self) -> Vec<BT> {
+    pub fn remove_expired_idle(&mut self) -> Vec<BT> {
         let deadline = SystemTime::now() - self.max_idle;
         // once `extract_if` has been stabilized this can be used instead of the two-step manual way below
         // see https://github.com/rust-lang/rust/issues/59618
@@ -188,13 +198,14 @@ impl<BT: BackendTask> Queue<BT> {
             .collect_vec();
 
         self.active -= tasks.len();
+        self.update_expiration();
         tasks
     }
 
     /// Returns whether a possible candidate for the waiter is in the queue or not.
     /// A possible candidate is any active or idle Op currently in the queue that could become
     /// the one the waiter wants
-    fn contains_candidate(&self, wait_handle: &WaitHandle) -> bool {
+    pub fn contains_candidate(&self, wait_handle: &WaitHandle) -> bool {
         self.queue
             .iter()
             .find(|(id, qe)| {
@@ -212,7 +223,7 @@ impl<BT: BackendTask> Queue<BT> {
     /// make space for a new reservation
     /// The resulting `FreedHandle` needs to be finalized before it can be used
     /// as a ReserveHandle
-    fn try_free(&mut self, wait_handle: WaitHandle) -> Either<FreedHandle<BT>, WaitHandle> {
+    pub fn try_free(&mut self, wait_handle: WaitHandle) -> Either<FreedHandle<BT>, WaitHandle> {
         // this gets the oldest (idle the longest) idle entry
         let (id, entry) = match self
             .queue
@@ -252,6 +263,7 @@ impl<BT: BackendTask> Queue<BT> {
             _ => unreachable!(),
         };
         self.return_handle(wait_handle);
+        self.update_expiration();
         Either::Left(FreedHandle {
             task,
             handle: ReserveHandle {
@@ -262,7 +274,7 @@ impl<BT: BackendTask> Queue<BT> {
         })
     }
 
-    fn wait(&mut self, offset: u64) -> WaitHandle {
+    pub fn wait(&mut self, offset: u64) -> WaitHandle {
         let now = SystemTime::now();
         let id = self.id_counter;
         self.id_counter += 1;
@@ -283,9 +295,23 @@ impl<BT: BackendTask> Queue<BT> {
         }
     }
 
-    fn resume(&mut self, wait_handle: WaitHandle) -> Either<ActiveHandle<BT>, WaitHandle> {
-        let qe = match self.queue.get_mut(&wait_handle.id) {
-            Some(qe) => qe,
+    pub fn resume(&mut self, wait_handle: WaitHandle) -> Either<ActiveHandle<BT>, WaitHandle> {
+        // find an idle op at the requested offset
+        let (qe, id) = match self
+            .queue
+            .iter()
+            .find(|(k, v)| {
+                v.offset == wait_handle.offset
+                    && match v.op {
+                        Op::Idle(_) => true,
+                        _ => false,
+                    }
+            })
+            .map(|(k, v)| k.clone())
+            .map(|id| self.queue.get_mut(&id).map(|e| (e, id)))
+            .flatten()
+        {
+            Some((qe, id)) => (qe, id),
             None => {
                 return Either::Right(wait_handle);
             }
@@ -302,8 +328,8 @@ impl<BT: BackendTask> Queue<BT> {
         };
         let offset = task.offset();
         qe.offset = offset;
-        let id = wait_handle.id;
         self.return_handle(wait_handle);
+        self.update_expiration();
         return Either::Left(ActiveHandle {
             id,
             initial_offset: offset,
@@ -312,7 +338,7 @@ impl<BT: BackendTask> Queue<BT> {
         });
     }
 
-    fn reserve(&mut self, wait_handle: WaitHandle) -> Either<ReserveHandle, WaitHandle> {
+    pub fn reserve(&mut self, wait_handle: WaitHandle) -> Either<ReserveHandle, WaitHandle> {
         if self.active >= self.max_active {
             return Either::Right(wait_handle);
         }
@@ -337,7 +363,7 @@ impl<BT: BackendTask> Queue<BT> {
         })
     }
 
-    fn redeem(&mut self, reserve_handle: ReserveHandle, task: BT) -> ActiveHandle<BT> {
+    pub fn redeem(&mut self, reserve_handle: ReserveHandle, task: BT) -> ActiveHandle<BT> {
         let entry = self
             .queue
             .get_mut(&reserve_handle.id)
@@ -356,7 +382,7 @@ impl<BT: BackendTask> Queue<BT> {
         }
     }
 
-    fn return_handle<T: Into<Handle<BT>>>(&mut self, handle: T) {
+    pub fn return_handle<T: Into<Handle<BT>>>(&mut self, handle: T) {
         let id = match handle.into() {
             Handle::Wait(handle) => Some(handle.id),
             Handle::Reserve(handle) => {
@@ -369,7 +395,12 @@ impl<BT: BackendTask> Queue<BT> {
                 let now = SystemTime::now();
                 self.last_activity = now;
                 if handle.task.can_reuse() {
+                    let _ = self.file_tx.send(handle.task.to_file());
                     if let Some(qe) = self.queue.get_mut(&handle.id) {
+                        tracing::trace!(
+                            offset = handle.task.offset(),
+                            "returning reusable task to queue"
+                        );
                         qe.since = now;
                         qe.offset = handle.task.offset();
                         qe.op = Op::Idle(handle.task);
@@ -378,6 +409,10 @@ impl<BT: BackendTask> Queue<BT> {
                     // active counter is not reduced because idle is still counted as active
                     None
                 } else {
+                    tracing::debug!(
+                        offset = handle.task.offset(),
+                        "task not reusable, discarding"
+                    );
                     // task can not be reused and has to be discarded
                     if self.queue.contains_key(&handle.id) {
                         self.active -= 1;
@@ -391,23 +426,7 @@ impl<BT: BackendTask> Queue<BT> {
                 tracing::warn!("no queue entry found for id {} while returning handle", id);
             }
         }
-    }
-
-    pub async fn finalize(self) {
-        let mut finalizers = self
-            .queue
-            .into_iter()
-            .filter_map(|(_, qe)| match qe.op {
-                Op::Idle(task) => Some(task.finalize()),
-                _ => None,
-            })
-            .collect::<FuturesUnordered<_>>();
-
-        while let Some(res) = finalizers.next().await {
-            if let Err(err) = res {
-                tracing::error!(error = %err, "error finalizing backend task");
-            }
-        }
+        self.update_expiration();
     }
 }
 
@@ -435,32 +454,44 @@ impl<BT: BackendTask> From<ActiveHandle<BT>> for Handle<BT> {
     }
 }
 
-struct WaitHandle {
+pub struct WaitHandle {
     id: usize,
     offset: u64,
     since: SystemTime,
 }
 
-struct ReserveHandle {
+pub struct ReserveHandle {
     id: usize,
     offset: u64,
     since: SystemTime,
 }
 
-struct ActiveHandle<BT: BackendTask> {
+pub(super) struct ActiveHandle<BT: BackendTask> {
     id: usize,
     initial_offset: u64,
     since: SystemTime,
     task: BT,
 }
 
-struct FreedHandle<BT: BackendTask> {
+impl<BT: BackendTask> AsRef<BT> for ActiveHandle<BT> {
+    fn as_ref(&self) -> &BT {
+        &self.task
+    }
+}
+
+impl<BT: BackendTask> AsMut<BT> for ActiveHandle<BT> {
+    fn as_mut(&mut self) -> &mut BT {
+        &mut self.task
+    }
+}
+
+pub struct FreedHandle<BT: BackendTask> {
     task: BT,
     handle: ReserveHandle,
 }
 
 impl<BT: BackendTask> FreedHandle<BT> {
-    async fn finalize(self) -> (anyhow::Result<()>, ReserveHandle) {
+    pub async fn finalize(self) -> (anyhow::Result<()>, ReserveHandle) {
         let res = self.task.finalize().await;
         (res, self.handle)
     }

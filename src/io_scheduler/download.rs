@@ -1,26 +1,32 @@
-use crate::io_scheduler::{
-    Activity, Backend, BackendTask, Entry, Lease, Reservation, Scheduler, TasksStatus,
-};
+use crate::io_scheduler::queue::{ActiveHandle, Activity, Queue, ReserveHandle, WaitHandle};
+use crate::io_scheduler::{Backend, BackendTask, Entry, Lease, Scheduler};
 use crate::vfs::{File, FileReader, Inode, Vfs};
 use anyhow::bail;
+use anyhow::Result;
 use futures_util::AsyncSeekExt;
+use itertools::Either;
+use parking_lot::Mutex;
 use std::cmp::min;
 use std::io::SeekFrom;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+use tokio::sync::broadcast;
 use tracing::instrument;
 
 pub(crate) struct Download {
     vfs: Arc<Vfs>,
-    max_downloads: usize,
+    max_downloads: NonZeroUsize,
     max_wait_for_match: Duration,
     max_inactivity_for_match: Duration,
+    initial_idle: Duration,
+    max_idle: Duration,
 }
 
 impl Download {
     pub(crate) fn new(
         vfs: Arc<Vfs>,
+        initial_idle: Duration,
         max_idle: Duration,
         max_downloads: NonZeroUsize,
         max_wait_for_match: Duration,
@@ -28,12 +34,14 @@ impl Download {
     ) -> Scheduler<Self> {
         let downloader = Download {
             vfs,
-            max_downloads: max_downloads.get(),
+            max_downloads,
             max_wait_for_match,
             max_inactivity_for_match,
+            initial_idle,
+            max_idle,
         };
 
-        Scheduler::new(downloader, max_idle, true)
+        Scheduler::new(downloader, true)
     }
 
     async fn file(&self, file_id: u64) -> anyhow::Result<File> {
@@ -48,12 +56,7 @@ impl Download {
         }
     }
 
-    async fn download(
-        &self,
-        reservation: Reservation<Download>,
-        file_id: u64,
-        offset: u64,
-    ) -> anyhow::Result<Lease<Download>> {
+    async fn download(&self, file_id: u64, offset: u64) -> Result<FileReader> {
         let file = self.file(file_id).await?;
         tracing::debug!(
             id = file.id(),
@@ -63,17 +66,97 @@ impl Download {
         );
         let mut file_reader = self.vfs.read_file(&file).await?;
         file_reader.seek(SeekFrom::Start(offset)).await?;
-        Ok(reservation.redeem(file_reader)?)
+        Ok(file_reader)
     }
 
-    fn interested(&self, status: &TasksStatus, offset: u64) -> bool {
-        status
-            .idle_offsets
-            .iter()
-            .chain(status.active_offsets.iter())
-            .chain(status.reserved_offsets.iter())
-            .find(|n| n <= &&offset)
-            .is_some()
+    async fn try_resume_download<BT: BackendTask>(
+        &self,
+        offset: u64,
+        queue: &Arc<Mutex<Queue<BT>>>,
+    ) -> Result<Either<ActiveHandle<BT>, (WaitHandle, broadcast::Receiver<Activity>, u64)>> {
+        let wait_deadline = SystemTime::now() + self.max_wait_for_match;
+        // check if there are any active downloads or reservations that could become potentially interesting
+        let (mut wait_handle, mut activity_rx, file_id, mut last_activity, mut contains_candidate) = {
+            let mut queue = queue.lock();
+            let mut wait_handle = queue.wait(offset);
+            let file_id = queue.file().borrow().id();
+
+            // first, try to resume right now
+            wait_handle = match queue.resume(wait_handle) {
+                Either::Left(active_handle) => {
+                    tracing::trace!("immediate download resumption");
+                    return Ok(Either::Left(active_handle));
+                }
+                Either::Right(wait_handle) => wait_handle,
+            };
+
+            let activity = queue.activity();
+            if offset == 0 {
+                // no need to wait further in this case
+                return Ok(Either::Right((wait_handle, activity, file_id)));
+            }
+            let contains_candidate = queue.contains_candidate(&wait_handle);
+            (
+                wait_handle,
+                activity,
+                file_id,
+                queue.last_activity(),
+                contains_candidate,
+            )
+        };
+
+        loop {
+            // making sure it doesn't exceed total wait time
+            let inactivity_deadline =
+                min(last_activity + self.max_inactivity_for_match, wait_deadline);
+
+            let sleep_deadline = if contains_candidate {
+                // if there is a potential candidate we wait longer
+                wait_deadline
+            } else {
+                inactivity_deadline
+            };
+
+            let sleep_duration = sleep_deadline
+                .duration_since(SystemTime::now())
+                .unwrap_or_else(|_| Duration::from_secs(0));
+
+            tokio::select! {
+                _ = tokio::time::sleep(sleep_duration) => {
+                    tracing::trace!("waiting timeout reached");
+                    return Ok(Either::Right((wait_handle, activity_rx, file_id)));
+                },
+                res = activity_rx.recv() => {
+                    let activity = match res {
+                        Ok(activity) => activity,
+                        Err(err) => {
+                            queue.lock().return_handle(wait_handle);
+                            return Err(err.into());
+                        }
+                    };
+
+                    last_activity = activity.timestamp();
+                    let mut queue = queue.lock();
+                    if activity.offset() == offset {
+                        if let Activity::Idle(_, _) = activity {
+                            // we want this, try to get it
+                            wait_handle = match queue.resume(wait_handle) {
+                                Either::Left(active_handle) => {
+                                    // success
+                                    tracing::trace!("suitable idle task became available, resuming");
+                                    return Ok(Either::Left(active_handle));
+                                }
+                                Either::Right(wait_handle) => {
+                                    // we missed it
+                                    wait_handle
+                                }
+                            };
+                        }
+                    };
+                    contains_candidate = queue.contains_candidate(&wait_handle);
+                }
+            }
+        }
     }
 }
 
@@ -82,142 +165,96 @@ impl Backend for Download {
     type Key = u64;
 
     #[instrument[skip(self)]]
-    async fn begin(&self, key: &Self::Key) -> anyhow::Result<(File, Vec<Self::Task>)> {
+    async fn begin(&self, key: &Self::Key) -> anyhow::Result<Queue<Self::Task>> {
         let file = self.file(*key).await?;
         tracing::debug!(
             file_id = file.id(),
             file_name = file.name(),
             "download prepared"
         );
-        Ok((file, vec![]))
+        Ok(Queue::new(
+            self.max_downloads,
+            self.max_idle,
+            SystemTime::now() + self.initial_idle,
+            vec![],
+            file,
+        ))
     }
 
-    #[instrument(skip(self, entry))]
     async fn lease(
         &self,
-        entry: Arc<Mutex<Entry<Self>>>,
+        queue: Arc<Mutex<Queue<Self::Task>>>,
         offset: u64,
-    ) -> anyhow::Result<Lease<Self>> {
-        let wait_deadline = SystemTime::now() + self.max_wait_for_match;
+    ) -> Result<ActiveHandle<Self::Task>> {
         tracing::trace!("begin getting lease");
-        let (mut watch_rx, file_id) = {
-            let lock = entry.lock().unwrap();
-            (lock.status_tx.subscribe(), lock.key)
-        };
 
-        // Phase 1: try to wait for a suitable download to resume
-        'outer: while SystemTime::now() < wait_deadline {
-            // check if there are any active downloads or reservations that could become potentially interesting
-            let mut status = {
-                let mut lock = entry.lock().unwrap();
-
-                // first, try to get a lease right now
-                if let Some(lease) = lock.lease(&entry, offset) {
-                    return Ok(lease);
+        // Phase 1: try to resume a download
+        let (wait_handle, mut activity_rx, file_id) =
+            match self.try_resume_download(offset, &queue).await? {
+                Either::Left(active_handle) => {
+                    return Ok(active_handle);
                 }
-
-                // then get the current status
-                let status = lock.status();
-                // avoid unnecessary work by marking the current state as seen
-                watch_rx.mark_unchanged();
-                status
+                Either::Right(wait_handle) => wait_handle,
             };
 
-            loop {
-                if !self.interested(&status, offset) {
-                    // nothing interesting queued right now
-                    // no need to wait further, start a new download
-                    tracing::trace!("not interested in existing tasks");
-                    break 'outer;
+        // Phase 2: Start a new download
+        let mut handle = Either::Right(wait_handle);
+        loop {
+            match handle {
+                Either::Left(reserve_handle) => {
+                    // start a new download
+                    return match self.download(file_id, offset).await {
+                        Ok(file_reader) => {
+                            let mut queue = queue.lock();
+                            tracing::trace!("redeeming reservation");
+                            Ok(queue.redeem(reserve_handle, file_reader))
+                        }
+                        Err(err) => {
+                            let mut queue = queue.lock();
+                            queue.return_handle(reserve_handle);
+                            Err(err)
+                        }
+                    };
                 }
-
-                let sleep_deadline = match &status.activity {
-                    Activity::Active => wait_deadline,
-                    Activity::Idle(None) => SystemTime::now(),
-                    Activity::Idle(Some(last_activity)) => {
-                        *last_activity + self.max_inactivity_for_match
-                    }
-                };
-                // making sure it doesn't exceed total wait time
-                let sleep_deadline = min(sleep_deadline, wait_deadline);
-
-                let sleep_duration = sleep_deadline
-                    .duration_since(SystemTime::now())
-                    .unwrap_or_else(|_| Duration::from_secs(0));
-
-                tokio::select! {
-                    _ = tokio::time::sleep(sleep_duration) => {
-                        tracing::trace!("waiting timeout reached");
-                        break 'outer;
-                    },
-                    _ = watch_rx.changed() => {
-                        status = watch_rx.borrow_and_update().clone();
-                        if status.idle_offsets.contains(&offset) {
-                            tracing::trace!("suitable idle task became available");
-                            break;
+                Either::Right(wait_handle) => {
+                    match {
+                        let mut queue = queue.lock();
+                        // first, try to reserve a slot directly
+                        let wait_handle = match queue.reserve(wait_handle) {
+                            Either::Left(reserve_handle) => {
+                                // good, we got a reserve slot
+                                // skip to next iteration to start download
+                                tracing::trace!("new slot reserved");
+                                handle = Either::Left(reserve_handle);
+                                continue;
+                            }
+                            Either::Right(wait_handle) => wait_handle,
+                        };
+                        // unfortunately, no free slot could be reserved
+                        // next, try to free an idle slot
+                        let res = queue.try_free(wait_handle);
+                        // avoid unnecessary work by marking the current state as seen
+                        activity_rx = activity_rx.resubscribe();
+                        res
+                    } {
+                        Either::Left(freed_handle) => {
+                            // an idle slot has been freed for this reserved slot
+                            let (res, reserved_handle) = freed_handle.finalize().await;
+                            if let Err(err) = res {
+                                let mut queue = queue.lock();
+                                queue.return_handle(reserved_handle);
+                                return Err(err);
+                            }
+                            tracing::trace!("freed download and acquired reservation");
+                            handle = Either::Left(reserved_handle);
+                        }
+                        Either::Right(wait_handle) => {
+                            // everything is busy and full, try again once something changes
+                            handle = Either::Right(wait_handle);
+                            let _ = activity_rx.recv().await?;
                         }
                     }
                 }
-            }
-        }
-
-        // Phase 2: Start a new download
-        let mut reservation = None;
-
-        loop {
-            // let's see if we hold a reservation
-            if let Some(reservation) = match reservation.take() {
-                // we do, proceed to download attempt
-                Some(reservation) => Some(reservation),
-                // no reservation, try to get one
-                None => {
-                    let mut lock = entry.lock().unwrap();
-                    // first, try again if we can get a lease right away
-                    if let Some(lease) = lock.lease(&entry, offset) {
-                        return Ok(lease);
-                    }
-
-                    // check task capacity first, reserve if still free
-                    if lock.tasks.len() < self.max_downloads {
-                        // reserve a slot
-                        let reservation = lock.make_reservation(&entry, offset);
-                        Some(reservation)
-                    } else {
-                        None
-                    }
-                }
-            } {
-                // managed to get a reservation
-                // start a new download
-                return self.download(reservation, file_id, offset).await;
-            }
-
-            let mut freed_task = None;
-            // try to remove the oldest idle download
-            {
-                let mut lock = entry.lock().unwrap();
-                if lock.tasks.len() >= self.max_downloads {
-                    // remove the oldest idle download
-                    freed_task = lock.free_task();
-                }
-                if lock.tasks.len() < self.max_downloads {
-                    // free_task seems to have worked
-                    // get a reservation and try downloading again
-                    reservation = Some(lock.make_reservation(&entry, offset));
-                }
-
-                // avoid unnecessary work by marking the current state as seen
-                watch_rx.mark_unchanged();
-            }
-            // don't forget to finalize the freed task (if we have one)
-            if let Some(task) = freed_task.take() {
-                tracing::trace!("finalizing freed task");
-                task.finalize().await?;
-            }
-
-            if reservation.is_none() {
-                // everything is busy and full, try again once something changes
-                watch_rx.changed().await?
             }
         }
     }
@@ -234,5 +271,9 @@ impl BackendTask for FileReader {
 
     async fn finalize(self) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    fn to_file(&self) -> File {
+        self.file().clone()
     }
 }

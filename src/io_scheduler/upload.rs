@@ -1,16 +1,33 @@
+use crate::io_scheduler::queue::{ActiveHandle, Activity, Queue};
 use crate::io_scheduler::{Backend, BackendTask, Entry, Lease, Scheduler};
 use crate::vfs::{File, FileWriter, Inode, Vfs};
 use anyhow::bail;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use itertools::Either;
+use parking_lot::Mutex;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 pub(crate) struct Upload {
     vfs: Arc<Vfs>,
+    initial_idle: Duration,
+    max_idle: Duration,
 }
 
 impl Upload {
-    pub(crate) fn new(vfs: Arc<Vfs>, max_idle: Duration) -> Scheduler<Self> {
-        Scheduler::new(Upload { vfs }, max_idle, false)
+    pub(crate) fn new(
+        vfs: Arc<Vfs>,
+        initial_idle: Duration,
+        max_idle: Duration,
+    ) -> Scheduler<Self> {
+        Scheduler::new(
+            Upload {
+                vfs,
+                initial_idle,
+                max_idle,
+            },
+            false,
+        )
     }
 }
 
@@ -18,7 +35,7 @@ impl Backend for Upload {
     type Task = FileWriter;
     type Key = (u64, String);
 
-    async fn begin(&self, key: &Self::Key) -> anyhow::Result<(File, Vec<Self::Task>)> {
+    async fn begin(&self, key: &Self::Key) -> anyhow::Result<Queue<Self::Task>> {
         let (parent_id, name) = key;
         let parent = match self.vfs.inode_by_id(*parent_id).await? {
             Some(Inode::Directory(dir)) => dir,
@@ -30,29 +47,60 @@ impl Backend for Upload {
             }
         };
 
-        let res = self.vfs.write_file(&parent, name.to_string()).await?;
-        let file = res.to_file();
-        Ok((file, vec![res]))
+        let fw = self.vfs.write_file(&parent, name.to_string()).await?;
+        let file = fw.to_file();
+        let queue = Queue::new(
+            NonZeroUsize::new(1).unwrap(),
+            self.max_idle,
+            SystemTime::now() + self.initial_idle,
+            vec![fw],
+            file,
+        );
+
+        Ok(queue)
     }
 
     async fn lease(
         &self,
-        entry: Arc<Mutex<Entry<Self>>>,
+        queue: Arc<Mutex<Queue<Self::Task>>>,
         offset: u64,
-    ) -> anyhow::Result<Lease<Self>> {
-        let mut watch_rx = { entry.lock().unwrap().status_tx.subscribe() };
+    ) -> anyhow::Result<ActiveHandle<Self::Task>> {
+        tracing::trace!("begin getting lease");
+        let (mut wait_handle, mut activity) = {
+            let mut queue = queue.lock();
+            (queue.wait(offset), queue.activity())
+        };
         loop {
-            // try to get one right now
             {
-                let mut lock = entry.lock().unwrap();
-                if let Some(lease) = lock.lease(&entry, offset) {
-                    return Ok(lease);
+                let mut queue = queue.lock();
+                match queue.resume(wait_handle) {
+                    Either::Left(active_handle) => {
+                        tracing::trace!("upload resumption");
+                        return Ok(active_handle);
+                    }
+                    Either::Right(h) => {
+                        wait_handle = h;
+                        activity = activity.resubscribe();
+                    }
                 }
             }
-
-            // wait for an update with the exact offset
-            while !watch_rx.borrow_and_update().idle_offsets.contains(&offset) {
-                watch_rx.changed().await?;
+            tracing::trace!("waiting for upload progress");
+            loop {
+                match activity.recv().await {
+                    Err(err) => {
+                        let mut queue = queue.lock();
+                        queue.return_handle(wait_handle);
+                        return Err(err.into());
+                    }
+                    Ok(activity) => {
+                        if activity.offset() == offset {
+                            if let Activity::Idle(..) = activity {
+                                tracing::trace!("suitable idle task became available, resuming");
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -70,5 +118,9 @@ impl BackendTask for FileWriter {
     async fn finalize(self) -> anyhow::Result<()> {
         let _ = self.finalize().await?;
         Ok(())
+    }
+
+    fn to_file(&self) -> File {
+        self.to_file()
     }
 }

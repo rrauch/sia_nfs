@@ -1829,6 +1829,7 @@ dependencies = [
  "futures-util",
  "itertools",
  "nfsserve",
+ "parking_lot",
  "renterd_client",
  "sqlx",
  "tokio",

@@ -33,12 +33,13 @@ impl SiaNfsFs {
     ) -> Self {
         let downloader = Download::new(
             vfs.clone(),
+            Duration::from_secs(2),
             max_download_idle,
             max_downloads_per_file,
             Duration::from_secs(1),
             Duration::from_millis(100),
         );
-        let uploader = Upload::new(vfs.clone(), max_upload_idle);
+        let uploader = Upload::new(vfs.clone(), Duration::from_secs(2), max_upload_idle);
         Self {
             downloader,
             uploader,
@@ -121,6 +122,7 @@ impl NFSFileSystem for SiaNfsFs {
         Ok((buf, dl.eof()))
     }
 
+    #[instrument(skip(self, data), fields(count = data.len()))]
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
         let file = match self.inode_by_id(id).await? {
             Inode::File(file) => file,
@@ -137,7 +139,7 @@ impl NFSFileSystem for SiaNfsFs {
             NFS3ERR_IO
         })?;
 
-        tracing::trace!(file = ?file, offset = offset, data = data.len(), "write complete");
+        tracing::debug!(file = ?file, offset = offset, data = data.len(), "write complete");
 
         Ok(to_fattr3(&Inode::File(upload.to_file())))
     }
@@ -156,6 +158,7 @@ impl NFSFileSystem for SiaNfsFs {
         Ok((id, to_fattr3(&inode)))
     }
 
+    #[instrument(skip(self))]
     async fn create_exclusive(
         &self,
         dirid: fileid3,
