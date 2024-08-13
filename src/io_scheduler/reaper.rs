@@ -1,5 +1,5 @@
 use crate::io_scheduler::queue::Queue;
-use crate::io_scheduler::{Backend, BackendTask, SharedState, Status};
+use crate::io_scheduler::{Backend, BackendTask, State, Status};
 use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt, StreamExt};
 use itertools::Itertools;
@@ -22,7 +22,7 @@ pub(super) struct Reaper<B: Backend> {
 }
 
 impl<B: Backend + 'static> Reaper<B> {
-    pub fn new(shared_state: Arc<RwLock<SharedState<B>>>) -> Self {
+    pub fn new(shared_state: Arc<RwLock<State<B>>>) -> Self {
         let (notify_tx, notify_rx) = watch::channel(());
         let mut runner = Runner {
             shared_state,
@@ -57,13 +57,13 @@ impl<B: Backend> Drop for Reaper<B> {
 }
 
 struct Runner<B: Backend> {
-    shared_state: Arc<RwLock<SharedState<B>>>,
+    shared_state: Arc<RwLock<State<B>>>,
     notify_rx: watch::Receiver<()>,
     expiration_tracker: ExpirationTracker<B>,
 }
 
-fn sync<B: Backend>(expiration_tracker: &mut ExpirationTracker<B>, shared_state: &SharedState<B>) {
-    expiration_tracker.sync(shared_state.active.iter().filter_map(|(k, v)| {
+fn sync<B: Backend>(expiration_tracker: &mut ExpirationTracker<B>, shared_state: &State<B>) {
+    expiration_tracker.sync(shared_state.queues.iter().filter_map(|(k, v)| {
         if let Status::Ready(entry) = v {
             Some((k, entry))
         } else {
@@ -86,7 +86,7 @@ impl<B: Backend> Runner<B> {
                 let mut shared_state = self.shared_state.write();
                 self.expiration_tracker.expired.iter().for_each(|key| {
                     let mut reap = false;
-                    if let Some(Status::Ready(queue)) = shared_state.active.get(key) {
+                    if let Some(Status::Ready(queue)) = shared_state.queues.get(key) {
                         {
                             let mut guard = queue.lock();
                             guard
@@ -107,7 +107,7 @@ impl<B: Backend> Runner<B> {
                         }
                     }
                     if reap {
-                        shared_state.active.remove(key);
+                        shared_state.queues.remove(key);
                         shared_state.file_id_keys.remove_by_right(key);
                         tracing::debug!("removed expired queue {:?}", key);
                     }

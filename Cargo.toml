@@ -20,7 +20,6 @@ nfsserve = "0.10"
 url = "2.5"
 async-trait = "0.1"
 async-recursion = "1.1"
-arc-swap = "1.7"
 parking_lot = "0.12"
 
 [build-dependencies]

@@ -34,6 +34,7 @@ impl Backend for Upload {
     type Task = FileWriter;
     type Key = (u64, String);
 
+    #[allow(private_interfaces)]
     async fn begin(&self, key: &Self::Key) -> anyhow::Result<Queue<Self::Task>> {
         let (parent_id, name) = key;
         let parent = match self.vfs.inode_by_id(*parent_id).await? {
@@ -48,6 +49,13 @@ impl Backend for Upload {
 
         let fw = self.vfs.write_file(&parent, name.to_string()).await?;
         let file = fw.to_file();
+
+        tracing::debug!(
+            file_id = file.id(),
+            file_name = file.name(),
+            "upload prepared"
+        );
+
         let queue = Queue::new(
             NonZeroUsize::new(1).unwrap(),
             self.max_idle,
@@ -59,12 +67,13 @@ impl Backend for Upload {
         Ok(queue)
     }
 
+    #[allow(private_interfaces)]
     async fn acquire(
         &self,
         queue: Arc<Queue<Self::Task>>,
         offset: u64,
     ) -> anyhow::Result<ActiveHandle<Self::Task>> {
-        tracing::trace!("begin getting lease");
+        tracing::trace!("begin acquiring handle");
         let (mut wait_handle, mut activity) = {
             let mut quard = queue.lock();
             (quard.wait(offset), queue.activity())

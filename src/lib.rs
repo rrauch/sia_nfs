@@ -1,6 +1,6 @@
+mod io_scheduler;
 mod nfs;
 mod vfs;
-mod io_scheduler;
 
 use crate::nfs::SiaNfsFs;
 use crate::vfs::Vfs;
@@ -8,7 +8,7 @@ use anyhow::Result;
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{ConnectOptions, Pool, Sqlite};
-use std::num::NonZeroUsize;
+use std::num::{NonZeroI16, NonZeroUsize};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,6 +26,8 @@ impl SiaNfs {
         renterd_password: &str,
         db_path: &Path,
         buckets: Vec<String>,
+        host: &str,
+        port: NonZeroI16,
     ) -> Result<Self> {
         let renterd = renterd_client::ClientBuilder::new()
             .api_endpoint_url(renterd_endpoint)
@@ -36,15 +38,18 @@ impl SiaNfs {
         let db = db_init(db_path, 20, true).await?;
 
         let vfs = Arc::new(Vfs::new(renterd, db, buckets, NonZeroUsize::new(25).unwrap()).await?);
-        //Self::foo(&vfs).await?;
 
         Ok(Self {
             listener: NFSTcpListener::bind(
-                "127.0.0.1:12000",
+                format!("{}:{}", host, port.get()).as_str(),
                 SiaNfsFs::new(
                     vfs,
                     NonZeroUsize::new(5).unwrap(),
+                    Duration::from_secs(2),
                     Duration::from_secs(3),
+                    Duration::from_secs(1),
+                    Duration::from_millis(200),
+                    Duration::from_secs(5),
                     Duration::from_secs(5),
                 ),
             )
@@ -56,37 +61,6 @@ impl SiaNfs {
         self.listener.handle_forever().await?;
         Ok(())
     }
-
-    /*pub async fn foo(vfs: &Vfs) -> Result<()> {
-        //let x = self.vfs.inode_by_name_parent("Montserrat.zip", 10006).await?;
-        //let x = self.vfs.inode_by_id(100010).await?;
-        let x = vfs.root().clone();
-        for inode in vfs.read_dir(&x).await? {
-            println!("{:?}", inode);
-            if let Inode::Directory(dir) = inode {
-                for inode in vfs.read_dir(&dir).await? {
-                    println!(" {:?}", inode);
-                    if let Inode::Directory(dir) = inode {
-                        for inode in vfs.read_dir(&dir).await? {
-                            println!("  {:?}", inode);
-                            if let Inode::Directory(dir) = inode {
-                                for inode in vfs.read_dir(&dir).await? {
-                                    println!("   {:?}", inode);
-                                    if let Inode::Directory(dir) = inode {
-                                        for inode in vfs.read_dir(&dir).await? {
-                                            println!("    {:?}", inode);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        todo!()
-    }
-     */
 }
 
 async fn db_init(

@@ -1,12 +1,10 @@
 use crate::io_scheduler::BackendTask;
 use crate::vfs::File;
-use futures_util::stream::FuturesUnordered;
-use futures_util::StreamExt;
 use itertools::{Either, Itertools};
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -93,8 +91,8 @@ impl<BT: BackendTask> Queue<BT> {
         let now = SystemTime::now();
         let (last_activity_tx, last_activity_rx) = watch::channel(now);
         let mut id_counter = 0;
-        let mut active = Arc::new(AtomicUsize::new(0));
-        let mut queue_len = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let queue_len = Arc::new(AtomicUsize::new(0));
         let shared = Arc::new(Mutex::new(Shared {
             file_tx,
             last_activity_tx,
@@ -358,7 +356,6 @@ impl<BT: BackendTask> Shared<BT> {
             task,
             handle: ReserveHandle {
                 id,
-                since: now,
                 offset,
                 shared: inner,
                 armed: true,
@@ -384,7 +381,6 @@ impl<BT: BackendTask> Shared<BT> {
         WaitHandle {
             id,
             offset,
-            since: now,
             shared: inner.clone(),
             armed: true,
         }
@@ -398,14 +394,14 @@ impl<BT: BackendTask> Shared<BT> {
         let (qe, id) = match self
             .queue
             .iter()
-            .find(|(k, v)| {
+            .find(|(_, v)| {
                 v.offset == wait_handle.offset
                     && match v.op {
                         Op::Idle(_) => true,
                         _ => false,
                     }
             })
-            .map(|(k, v)| k.clone())
+            .map(|(k, _)| k.clone())
             .map(|id| self.queue.get_mut(&id).map(|e| (e, id)))
             .flatten()
         {
@@ -432,7 +428,6 @@ impl<BT: BackendTask> Shared<BT> {
         return Either::Left(ActiveHandle {
             id,
             initial_offset: offset,
-            since: now,
             task: Some(task),
             shared: inner,
         });
@@ -465,7 +460,6 @@ impl<BT: BackendTask> Shared<BT> {
 
         Either::Left(ReserveHandle {
             id: wait_handle.id,
-            since: now,
             offset: wait_handle.offset,
             shared: wait_handle.shared.clone(),
             armed: true,
@@ -488,7 +482,6 @@ impl<BT: BackendTask> Shared<BT> {
         let _ = self.activity_tx.send(Activity::Active(task.offset(), now));
         ActiveHandle {
             id: reserve_handle.id,
-            since: now,
             initial_offset: entry.offset,
             task: Some(task),
             shared: reserve_handle.shared.clone(),
@@ -499,7 +492,6 @@ impl<BT: BackendTask> Shared<BT> {
 pub struct WaitHandle<BT: BackendTask> {
     id: usize,
     offset: u64,
-    since: SystemTime,
     shared: Arc<Mutex<Shared<BT>>>,
     armed: bool,
 }
@@ -538,7 +530,6 @@ impl<BT: BackendTask> Drop for WaitHandle<BT> {
 pub struct ReserveHandle<BT: BackendTask> {
     id: usize,
     offset: u64,
-    since: SystemTime,
     shared: Arc<Mutex<Shared<BT>>>,
     armed: bool,
 }
@@ -579,7 +570,6 @@ impl<BT: BackendTask> Drop for ReserveHandle<BT> {
 pub(crate) struct ActiveHandle<BT: BackendTask> {
     id: usize,
     initial_offset: u64,
-    since: SystemTime,
     task: Option<BT>,
     shared: Arc<Mutex<Shared<BT>>>,
 }

@@ -1,5 +1,6 @@
 use sia_nfs::SiaNfs;
 use std::env;
+use std::num::NonZeroI16;
 use std::path::PathBuf;
 use std::str::FromStr;
 use tracing::Level;
@@ -26,11 +27,12 @@ async fn main() -> anyhow::Result<()> {
         renterd_password,
         PathBuf::from_str(db_path)?.as_path(),
         vec!["default".to_string()],
+        "127.0.0.1",
+        NonZeroI16::new(12000).unwrap(),
     )
     .await?;
 
     sia_nfs.run().await?;
 
-    println!("");
     Ok(())
 }

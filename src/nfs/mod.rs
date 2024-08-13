@@ -28,18 +28,22 @@ impl SiaNfsFs {
     pub(super) fn new(
         vfs: Arc<Vfs>,
         max_downloads_per_file: NonZeroUsize,
-        max_download_idle: Duration,
-        max_upload_idle: Duration,
+        download_initial_idle: Duration,
+        download_max_idle: Duration,
+        download_max_wait_for_match: Duration,
+        download_max_inactivity_for_match: Duration,
+        upload_initial_idle: Duration,
+        upload_max_idle: Duration,
     ) -> Self {
         let downloader = Download::new(
             vfs.clone(),
-            Duration::from_secs(2),
-            max_download_idle,
+            download_initial_idle,
+            download_max_idle,
             max_downloads_per_file,
-            Duration::from_secs(1),
-            Duration::from_millis(100),
+            download_max_wait_for_match,
+            download_max_inactivity_for_match,
         );
-        let uploader = Upload::new(vfs.clone(), Duration::from_secs(2), max_upload_idle);
+        let uploader = Upload::new(vfs.clone(), upload_initial_idle, upload_max_idle);
         Self {
             downloader,
             uploader,
@@ -97,9 +101,9 @@ impl NFSFileSystem for SiaNfsFs {
         if count == 0 {
             return Ok((vec![], true));
         }
-        let id = Box::new(file.id());
+        let id = file.id();
         let file = self.downloader.prepare(&id).await.map_err(|e| {
-            tracing::error!(error = %e, "failed to prepare download for file {}", file.id());
+            tracing::error!(error = %e, "failed to prepare download for file {}", id);
             NFS3ERR_SERVERFAULT
         })?;
 
@@ -108,7 +112,7 @@ impl NFSFileSystem for SiaNfsFs {
             .acquire(file.id(), offset)
             .await
             .map_err(|e| {
-                tracing::error!(error = %e, "failed to get download lease for file {}", file.id());
+                tracing::error!(error = %e, "failed to acquire download handle for file {}", file.id());
                 NFS3ERR_SERVERFAULT
             })?;
         let dl = dl.as_mut();
@@ -130,10 +134,14 @@ impl NFSFileSystem for SiaNfsFs {
             Inode::Directory(_) => return Err(NFS3ERR_ISDIR),
         };
 
-        let mut upload = self.uploader.acquire(file.id(), offset).await.map_err(|e| {
-            tracing::error!(error = %e, "failed to get upload lease");
-            NFS3ERR_NOENT
-        })?;
+        let mut upload = self
+            .uploader
+            .acquire(file.id(), offset)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to acquire upload handle for {}", file.id());
+                NFS3ERR_NOENT
+            })?;
         let upload = upload.as_mut();
 
         upload.write_all(data).await.map_err(|e| {
@@ -177,7 +185,7 @@ impl NFSFileSystem for SiaNfsFs {
             .prepare(&(parent.id(), name.to_string()))
             .await
             .map_err(|e| {
-                tracing::error!(error = %e, "upload_manager error");
+                tracing::error!(error = %e, "failed to prepare upload");
                 NFS3ERR_IO
             })?;
 
@@ -314,7 +322,7 @@ impl SiaNfsFs {
     async fn inode_by_id(&self, id: fileid3) -> Result<Inode, nfsstat3> {
         // check pending uploads first
         if let Some(file) = self.uploader.file_by_id(id).await.map_err(|e| {
-            tracing::error!(error = %e, "error looking up id in upload manager");
+            tracing::error!(error = %e, "error looking up id in uploader");
             NFS3ERR_SERVERFAULT
         })? {
             return Ok(Inode::File(file));
@@ -343,7 +351,7 @@ impl SiaNfsFs {
             .file_by_key(&(dirid, name.to_string()))
             .await
             .map_err(|e| {
-                tracing::error!(error = %e, "error looking up id in pending list");
+                tracing::error!(error = %e, "error looking up id in uploader");
                 NFS3ERR_SERVERFAULT
             })?
         {

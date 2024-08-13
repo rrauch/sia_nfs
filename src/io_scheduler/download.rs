@@ -174,12 +174,13 @@ impl Backend for Download {
         ))
     }
 
+    #[allow(private_interfaces)]
     async fn acquire(
         &self,
         queue: Arc<Queue<Self::Task>>,
         offset: u64,
     ) -> Result<ActiveHandle<Self::Task>> {
-        tracing::trace!("begin getting lease");
+        tracing::trace!("begin acquiring handle");
 
         // Phase 1: try to resume a download
         let (wait_handle, mut activity_rx, file_id) =
