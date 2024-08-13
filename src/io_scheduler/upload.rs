@@ -1,9 +1,8 @@
 use crate::io_scheduler::queue::{ActiveHandle, Activity, Queue};
-use crate::io_scheduler::{Backend, BackendTask, Entry, Lease, Scheduler};
+use crate::io_scheduler::{Backend, BackendTask, Scheduler};
 use crate::vfs::{File, FileWriter, Inode, Vfs};
 use anyhow::bail;
 use itertools::Either;
-use parking_lot::Mutex;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -60,15 +59,15 @@ impl Backend for Upload {
         Ok(queue)
     }
 
-    async fn lease(
+    async fn acquire(
         &self,
-        queue: Arc<Mutex<Queue<Self::Task>>>,
+        queue: Arc<Queue<Self::Task>>,
         offset: u64,
     ) -> anyhow::Result<ActiveHandle<Self::Task>> {
         tracing::trace!("begin getting lease");
         let (mut wait_handle, mut activity) = {
-            let mut queue = queue.lock();
-            (queue.wait(offset), queue.activity())
+            let mut quard = queue.lock();
+            (quard.wait(offset), queue.activity())
         };
         loop {
             {
@@ -86,19 +85,11 @@ impl Backend for Upload {
             }
             tracing::trace!("waiting for upload progress");
             loop {
-                match activity.recv().await {
-                    Err(err) => {
-                        let mut queue = queue.lock();
-                        queue.return_handle(wait_handle);
-                        return Err(err.into());
-                    }
-                    Ok(activity) => {
-                        if activity.offset() == offset {
-                            if let Activity::Idle(..) = activity {
-                                tracing::trace!("suitable idle task became available, resuming");
-                                break;
-                            }
-                        }
+                let activity = activity.recv().await?;
+                if activity.offset() == offset {
+                    if let Activity::Idle(..) = activity {
+                        tracing::trace!("suitable idle task became available, resuming");
+                        break;
                     }
                 }
             }

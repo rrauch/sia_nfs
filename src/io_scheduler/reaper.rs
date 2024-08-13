@@ -1,4 +1,5 @@
-use crate::io_scheduler::{Backend, BackendTask, Entry, SharedState, Status};
+use crate::io_scheduler::queue::Queue;
+use crate::io_scheduler::{Backend, BackendTask, SharedState, Status};
 use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt, StreamExt};
 use itertools::Itertools;
@@ -85,10 +86,10 @@ impl<B: Backend> Runner<B> {
                 let mut shared_state = self.shared_state.write();
                 self.expiration_tracker.expired.iter().for_each(|key| {
                     let mut reap = false;
-                    if let Some(Status::Ready(entry)) = shared_state.active.get(key) {
+                    if let Some(Status::Ready(queue)) = shared_state.active.get(key) {
                         {
-                            let mut queue = entry.queue.lock();
-                            queue
+                            let mut guard = queue.lock();
+                            guard
                                 .remove_expired_idle()
                                 .into_iter()
                                 .for_each(|t| finalizations.push(t.finalize()));
@@ -96,9 +97,9 @@ impl<B: Backend> Runner<B> {
                         };
 
                         if reap {
-                            if Arc::strong_count(&entry.queue) != 1 {
+                            if Arc::strong_count(queue) != 1 {
                                 tracing::debug!(
-                                    "entry {:?} empty but still held, postponing removal",
+                                    "queue {:?} empty but still held, postponing removal",
                                     key
                                 );
                                 reap = false;
@@ -108,7 +109,7 @@ impl<B: Backend> Runner<B> {
                     if reap {
                         shared_state.active.remove(key);
                         shared_state.file_id_keys.remove_by_right(key);
-                        tracing::debug!("removed expired entry {:?}", key);
+                        tracing::debug!("removed expired queue {:?}", key);
                     }
                 })
             }
@@ -127,7 +128,7 @@ impl<B: Backend> Runner<B> {
                 self.notify_rx.mark_unchanged();
             }
 
-            // wait until either the next expiration or until a new entry has been added
+            // wait until either the next expiration or until a new queue has been added
             tokio::select! {
                 _ = self.expiration_tracker.wait_for_next_expiration(Duration::from_millis(50)) => {},
                 _ = self.notify_rx.changed() => {}
@@ -145,7 +146,7 @@ struct ExpirationTracker<B: Backend> {
 impl<B: Backend> ExpirationTracker<B> {
     fn sync<'a, I>(&mut self, active: I)
     where
-        I: Iterator<Item = (&'a B::Key, &'a Entry<B>)>,
+        I: Iterator<Item = (&'a B::Key, &'a Arc<Queue<B::Task>>)>,
         B: 'a,
     {
         let mut seen_keys = HashSet::new();

@@ -3,15 +3,13 @@ use crate::io_scheduler::reaper::Reaper;
 use crate::vfs::File;
 use anyhow::{anyhow, bail, Result};
 use bimap::BiHashMap;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
 use std::hash::Hash;
-use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use std::time::SystemTime;
-use tokio::sync::{watch, Notify};
+use tokio::sync::Notify;
 
 pub(crate) mod download;
 mod queue;
@@ -57,11 +55,11 @@ impl<B: Backend + 'static + Sync> Scheduler<B> {
                         (notify_ready, Some(self.backend.begin(key)))
                     }
                     Some(Status::Preparing(notify)) => (notify.clone(), None),
-                    Some(Status::Ready(entry)) => {
+                    Some(Status::Ready(queue)) => {
                         if self.allow_prepare_existing {
-                            return Ok(entry.file.borrow().clone());
+                            return Ok(queue.file().borrow().clone());
                         } else {
-                            bail!("entry for key {:?} already exists", key);
+                            bail!("queue for key {:?} already exists", key);
                         }
                     }
                 }
@@ -74,18 +72,13 @@ impl<B: Backend + 'static + Sync> Scheduler<B> {
                 return match res {
                     Ok(queue) => {
                         let file = queue.file().borrow().clone();
-                        let entry = Entry {
-                            expiration: queue.expiration(),
-                            file: queue.file(),
-                            queue: Arc::new(Mutex::new(queue)),
-                        };
                         shared_state
                             .active
-                            .insert(key.clone(), Status::Ready(entry));
+                            .insert(key.clone(), Status::Ready(Arc::new(queue)));
                         let file_id_keys = &mut shared_state.file_id_keys;
                         let file_id = file.id();
                         file_id_keys.insert(file_id, key.clone());
-                        // let the reaper know there's a new entry
+                        // let the reaper know there's a new queue
                         self.reaper.notify();
                         Ok(file)
                     }
@@ -102,35 +95,31 @@ impl<B: Backend + 'static + Sync> Scheduler<B> {
         }
     }
 
-    pub async fn lease(&self, file_id: u64, offset: u64) -> Result<Lease<B>> {
+    pub async fn acquire(&self, file_id: u64, offset: u64) -> Result<ActiveHandle<B::Task>> {
         let queue = {
             let shared_state = self.shared_state.read();
             let key = shared_state
                 .file_id_keys
                 .get_by_left(&file_id)
                 .ok_or_else(|| anyhow!("key for file_id {} not found", file_id))?;
-            let entry = match shared_state.active.get(&key) {
-                Some(Status::Ready(entry)) => entry,
+            let queue = match shared_state.active.get(&key) {
+                Some(Status::Ready(queue)) => queue,
                 _ => {
-                    bail!("unable to get ready entry for key {:?}", key);
+                    bail!("unable to get queue for key {:?}", key);
                 }
             };
-            entry.queue.clone()
+            queue.clone()
         };
 
-        let active_handle = self.backend.lease(queue.clone(), offset).await?;
-        Ok(Lease {
-            queue,
-            active_handle: Some(active_handle),
-        })
+        Ok(self.backend.acquire(queue, offset).await?)
     }
 
     pub async fn file_by_key(&self, key: &B::Key) -> Result<Option<File>> {
         loop {
             let notify = {
                 match self.shared_state.read().active.get(key) {
-                    Some(Status::Ready(entry)) => {
-                        return Ok(Some(entry.file.borrow().clone()));
+                    Some(Status::Ready(queue)) => {
+                        return Ok(Some(queue.file().borrow().clone()));
                     }
                     Some(Status::Preparing(notify)) => notify.clone(),
                     None => return Ok(None),
@@ -158,47 +147,7 @@ impl<B: Backend + 'static + Sync> Scheduler<B> {
 
 pub(crate) enum Status<B: Backend> {
     Preparing(Arc<Notify>),
-    Ready(Entry<B>),
-}
-
-struct Entry<B: Backend> {
-    queue: Arc<Mutex<Queue<B::Task>>>,
-    file: watch::Receiver<File>,
-    expiration: watch::Receiver<SystemTime>,
-}
-
-impl<B: Backend> Entry<B> {
-    fn expiration(&self) -> watch::Receiver<SystemTime> {
-        self.expiration.clone()
-    }
-}
-
-pub(crate) struct Lease<B: Backend> {
-    queue: Arc<Mutex<Queue<B::Task>>>,
-    active_handle: Option<ActiveHandle<B::Task>>,
-}
-
-impl<B: Backend> Drop for Lease<B> {
-    fn drop(&mut self) {
-        if let Some(handle) = self.active_handle.take() {
-            let mut queue = self.queue.lock();
-            queue.return_handle(handle);
-        }
-    }
-}
-
-impl<B: Backend> Deref for Lease<B> {
-    type Target = B::Task;
-
-    fn deref(&self) -> &Self::Target {
-        self.active_handle.as_ref().unwrap().as_ref()
-    }
-}
-
-impl<B: Backend> DerefMut for Lease<B> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.active_handle.as_mut().unwrap().as_mut()
-    }
+    Ready(Arc<Queue<B::Task>>),
 }
 
 pub(crate) trait Backend: Sized {
@@ -206,9 +155,9 @@ pub(crate) trait Backend: Sized {
     type Key: Hash + Eq + Clone + Send + 'static + Sync + Debug;
 
     fn begin(&self, key: &Self::Key) -> impl Future<Output = Result<Queue<Self::Task>>> + Send;
-    async fn lease(
+    async fn acquire(
         &self,
-        entry: Arc<Mutex<Queue<Self::Task>>>,
+        queue: Arc<Queue<Self::Task>>,
         offset: u64,
     ) -> Result<ActiveHandle<Self::Task>>;
 }

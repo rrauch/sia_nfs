@@ -1,11 +1,10 @@
-use crate::io_scheduler::queue::{ActiveHandle, Activity, Queue, ReserveHandle, WaitHandle};
-use crate::io_scheduler::{Backend, BackendTask, Entry, Lease, Scheduler};
+use crate::io_scheduler::queue::{ActiveHandle, Activity, Queue, WaitHandle};
+use crate::io_scheduler::{Backend, BackendTask, Scheduler};
 use crate::vfs::{File, FileReader, Inode, Vfs};
 use anyhow::bail;
 use anyhow::Result;
 use futures_util::AsyncSeekExt;
 use itertools::Either;
-use parking_lot::Mutex;
 use std::cmp::min;
 use std::io::SeekFrom;
 use std::num::NonZeroUsize;
@@ -72,17 +71,18 @@ impl Download {
     async fn try_resume_download<BT: BackendTask>(
         &self,
         offset: u64,
-        queue: &Arc<Mutex<Queue<BT>>>,
-    ) -> Result<Either<ActiveHandle<BT>, (WaitHandle, broadcast::Receiver<Activity>, u64)>> {
+        queue: &Arc<Queue<BT>>,
+    ) -> Result<Either<ActiveHandle<BT>, (WaitHandle<BT>, broadcast::Receiver<Activity>, u64)>>
+    {
         let wait_deadline = SystemTime::now() + self.max_wait_for_match;
         // check if there are any active downloads or reservations that could become potentially interesting
         let (mut wait_handle, mut activity_rx, file_id, mut last_activity, mut contains_candidate) = {
-            let mut queue = queue.lock();
-            let mut wait_handle = queue.wait(offset);
+            let mut guard = queue.lock();
+            let mut wait_handle = guard.wait(offset);
             let file_id = queue.file().borrow().id();
 
             // first, try to resume right now
-            wait_handle = match queue.resume(wait_handle) {
+            wait_handle = match guard.resume(wait_handle) {
                 Either::Left(active_handle) => {
                     tracing::trace!("immediate download resumption");
                     return Ok(Either::Left(active_handle));
@@ -95,7 +95,7 @@ impl Download {
                 // no need to wait further in this case
                 return Ok(Either::Right((wait_handle, activity, file_id)));
             }
-            let contains_candidate = queue.contains_candidate(&wait_handle);
+            let contains_candidate = guard.contains_candidate(&wait_handle);
             (
                 wait_handle,
                 activity,
@@ -127,14 +127,7 @@ impl Download {
                     return Ok(Either::Right((wait_handle, activity_rx, file_id)));
                 },
                 res = activity_rx.recv() => {
-                    let activity = match res {
-                        Ok(activity) => activity,
-                        Err(err) => {
-                            queue.lock().return_handle(wait_handle);
-                            return Err(err.into());
-                        }
-                    };
-
+                    let activity = res?;
                     last_activity = activity.timestamp();
                     let mut queue = queue.lock();
                     if activity.offset() == offset {
@@ -181,9 +174,9 @@ impl Backend for Download {
         ))
     }
 
-    async fn lease(
+    async fn acquire(
         &self,
-        queue: Arc<Mutex<Queue<Self::Task>>>,
+        queue: Arc<Queue<Self::Task>>,
         offset: u64,
     ) -> Result<ActiveHandle<Self::Task>> {
         tracing::trace!("begin getting lease");
@@ -203,18 +196,10 @@ impl Backend for Download {
             match handle {
                 Either::Left(reserve_handle) => {
                     // start a new download
-                    return match self.download(file_id, offset).await {
-                        Ok(file_reader) => {
-                            let mut queue = queue.lock();
-                            tracing::trace!("redeeming reservation");
-                            Ok(queue.redeem(reserve_handle, file_reader))
-                        }
-                        Err(err) => {
-                            let mut queue = queue.lock();
-                            queue.return_handle(reserve_handle);
-                            Err(err)
-                        }
-                    };
+                    let file_reader = self.download(file_id, offset).await?;
+                    let mut queue = queue.lock();
+                    tracing::trace!("redeeming reservation");
+                    return Ok(queue.redeem(reserve_handle, file_reader));
                 }
                 Either::Right(wait_handle) => {
                     match {
@@ -239,12 +224,7 @@ impl Backend for Download {
                     } {
                         Either::Left(freed_handle) => {
                             // an idle slot has been freed for this reserved slot
-                            let (res, reserved_handle) = freed_handle.finalize().await;
-                            if let Err(err) = res {
-                                let mut queue = queue.lock();
-                                queue.return_handle(reserved_handle);
-                                return Err(err);
-                            }
+                            let reserved_handle = freed_handle.finalize().await?;
                             tracing::trace!("freed download and acquired reservation");
                             handle = Either::Left(reserved_handle);
                         }

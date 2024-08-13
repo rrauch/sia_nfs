@@ -105,12 +105,13 @@ impl NFSFileSystem for SiaNfsFs {
 
         let mut dl = self
             .downloader
-            .lease(file.id(), offset)
+            .acquire(file.id(), offset)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to get download lease for file {}", file.id());
                 NFS3ERR_SERVERFAULT
             })?;
+        let dl = dl.as_mut();
 
         let mut buf = Vec::with_capacity(count);
         buf.resize(buf.capacity(), 0x00);
@@ -129,10 +130,11 @@ impl NFSFileSystem for SiaNfsFs {
             Inode::Directory(_) => return Err(NFS3ERR_ISDIR),
         };
 
-        let mut upload = self.uploader.lease(file.id(), offset).await.map_err(|e| {
+        let mut upload = self.uploader.acquire(file.id(), offset).await.map_err(|e| {
             tracing::error!(error = %e, "failed to get upload lease");
             NFS3ERR_NOENT
         })?;
+        let upload = upload.as_mut();
 
         upload.write_all(data).await.map_err(|e| {
             tracing::error!(error = %e, "write error");
