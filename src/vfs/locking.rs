@@ -1,9 +1,10 @@
 use anyhow::bail;
 use itertools::Itertools;
+use parking_lot::Mutex;
 use std::cmp::PartialEq;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 use tokio::task::JoinHandle;
@@ -24,7 +25,7 @@ impl LockManager {
                 loop {
                     tokio::time::sleep(Duration::from_secs(60)).await;
                     {
-                        let mut locks = path_locks.lock().expect("unable to get file locks");
+                        let mut locks = path_locks.lock();
                         // remove all locks currently not held outside this map
                         locks.retain(|_, lock| Arc::strong_count(lock) > 1)
                     }
@@ -59,7 +60,7 @@ impl LockManager {
         });
 
         let locks = {
-            let mut path_locks = self.path_locks.lock().expect("unable to lock path_locks");
+            let mut path_locks = self.path_locks.lock();
             // it's important to sort the paths to avoid deadlocks, hopefully
             requests
                 .iter()
