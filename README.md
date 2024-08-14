@@ -61,7 +61,7 @@ buckets you want
 to export.
 
 You can now connect from any NFSv3-compatible client. Note that both the portmapper port and the mount port are set to
-*12000*.
+`12000`.
 
 ### Mount
 
