@@ -1,7 +1,8 @@
 use clap::Parser;
 use sia_nfs::SiaNfs;
 use std::path::PathBuf;
-use tracing::Level;
+use tokio::signal::unix::{signal, SignalKind};
+use tracing::{Instrument, Level};
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
@@ -54,7 +55,32 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    sia_nfs.run().await?;
+    let run_fut = sia_nfs.run();
 
-    Ok(())
+    let mut sigint = signal(SignalKind::interrupt()).unwrap();
+    let mut sigterm = signal(SignalKind::terminate()).unwrap();
+
+    let span = tracing::trace_span!("main");
+
+    async move {
+        tokio::select! {
+            _ = sigint.recv() => {
+                tracing::info!("SIGINT received, shutting down")
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("SIGTERM received, shutting down")
+            }
+            res = run_fut => {
+                match res {
+                    Ok(()) => tracing::info!("run finished, shutting down"),
+                    Err(err) => {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    .instrument(span)
+    .await
 }
