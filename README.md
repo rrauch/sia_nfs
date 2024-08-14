@@ -1,8 +1,8 @@
-# Sia NFS Gateway (sia-nfs)
+# Sia NFS Gateway (sia_nfs)
 
 ## Description
 
-`sia-nfs` provides access to one or more Sia buckets via a plain NFS interface, allowing any compatible client to access
+`sia_nfs` provides access to one or more Sia buckets via a plain NFS interface, allowing any compatible client to access
 the hosted files and directories directly without needing to run a Sia client
 or [renterd](https://sia.tech/software/renterd). This gateway can be used locally to mount a Sia filesystem or made
 available to an entire network. It is designed to work on Linux, macOS, Windows, and potentially other operating
@@ -33,7 +33,7 @@ release is available. It has only been tested on Linux (x86_64 & aarch64). Use a
 
 ## Test Drive
 
-A `Dockerfile` is included to make it easy for you to try out the project.
+A `Dockerfile` is included to make it easy for you to try out `sia_nfs`.
 
 ### Build
 
@@ -56,7 +56,8 @@ docker run -it --rm -p 12000:12000 -v sia_nfs_data:/config sia_nfs -e [renterd_a
 ```
 
 Replace `[renterd_api_endpoint]` with the URL of your renterd API, e.g., `http://localhost:9880/api/`.
-Replace `[renterd_api_password]` with your API password. Finally, replace `[bucket..]` with one or more buckets you want
+Replace `[renterd_api_password]` with your API password. Finally, replace `[bucket..]` with the names of one or more
+buckets you want
 to export.
 
 You can now connect from any NFSv3-compatible client. Note that both the portmapper port and the mount port are set to
