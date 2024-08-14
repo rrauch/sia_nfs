@@ -4,25 +4,25 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1.39", features = ["full"] }
-tokio-util = "0.7"
 anyhow = { version = "1.0", features = ["backtrace"] }
-renterd_client = { git = "https://github.com/rrauch/renterd_client.git", rev = "852cda036bc6f32dcdbcef43e851b501783085f3" }
+async-recursion = "1.1"
+async-trait = "0.1"
+bimap = "0.6"
 chrono = "0.4"
+clap = { version = "4.5", features = ["derive", "env"] }
 futures = "0.3"
 futures-util = "0.3"
-bimap = "0.6"
 itertools = "0.13"
+nfsserve = "0.10"
+parking_lot = "0.12"
+renterd_client = { git = "https://github.com/rrauch/renterd_client.git", rev = "852cda036bc6f32dcdbcef43e851b501783085f3" }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "migrate", "chrono"] }
+tokio = { version = "1.39", features = ["full"] }
+tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-nfsserve = "0.10"
 url = "2.5"
-async-trait = "0.1"
-async-recursion = "1.1"
-parking_lot = "0.12"
-clap = { version = "4.5", features = ["derive", "env"] }
 
 [build-dependencies]
-tokio = { version = "1.39", features = ["full"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "migrate", "chrono"] }
+tokio = { version = "1.39", features = ["full"] }
