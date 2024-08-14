@@ -7,7 +7,7 @@ edition = "2021"
 tokio = { version = "1.39", features = ["full"] }
 tokio-util = "0.7"
 anyhow = { version = "1.0", features = ["backtrace"] }
-renterd_client = { path = "../renterd_client" }
+renterd_client = { git = "https://github.com/rrauch/renterd_client.git", rev = "852cda036bc6f32dcdbcef43e851b501783085f3" }
 chrono = "0.4"
 futures = "0.3"
 futures-util = "0.3"
