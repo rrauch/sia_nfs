@@ -8,7 +8,7 @@ use anyhow::Result;
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{ConnectOptions, Pool, Sqlite};
-use std::num::{NonZeroI16, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,8 +26,7 @@ impl SiaNfs {
         renterd_password: &str,
         db_path: &Path,
         buckets: Vec<String>,
-        host: &str,
-        port: NonZeroI16,
+        listen_address: &str,
     ) -> Result<Self> {
         let renterd = renterd_client::ClientBuilder::new()
             .api_endpoint_url(renterd_endpoint)
@@ -41,7 +40,7 @@ impl SiaNfs {
 
         Ok(Self {
             listener: NFSTcpListener::bind(
-                format!("{}:{}", host, port.get()).as_str(),
+                listen_address,
                 SiaNfsFs::new(
                     vfs,
                     NonZeroUsize::new(5).unwrap(),
