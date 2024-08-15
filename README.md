@@ -25,6 +25,9 @@ systems.
 - **File Deletion:** Files can be deleted.
 - **Renaming and Moving:** Files and directories can be renamed and moved (within the same bucket).
 - **File Reading:** Files can be read as expected, including seeking.
+- **File Writing:** New files can be created and written to, including copying an existing file.
+
+**Note:** Existing files cannot be written to as Sia objects are immutable. 
 
 ## Status
 
