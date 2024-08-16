@@ -13,6 +13,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 futures = "0.3"
 futures-util = "0.3"
 itertools = "0.13"
+moka = { version = "0.12", features = ["future"] }
 nfsserve = "0.10"
 parking_lot = "0.12"
 renterd_client = { git = "https://github.com/rrauch/renterd_client.git", rev = "852cda036bc6f32dcdbcef43e851b501783085f3" }

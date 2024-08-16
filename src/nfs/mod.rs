@@ -320,14 +320,6 @@ impl NFSFileSystem for SiaNfsFs {
 
 impl SiaNfsFs {
     async fn inode_by_id(&self, id: fileid3) -> Result<Inode, nfsstat3> {
-        // check pending uploads first
-        if let Some(file) = self.uploader.file_by_id(id).await.map_err(|e| {
-            tracing::error!(error = %e, "error looking up id in uploader");
-            NFS3ERR_SERVERFAULT
-        })? {
-            return Ok(Inode::File(file));
-        }
-
         match self
             .vfs
             .inode_by_id(id)
@@ -345,19 +337,6 @@ impl SiaNfsFs {
         filename: &filename3,
     ) -> Result<Inode, nfsstat3> {
         let name = to_str(filename)?;
-        // check pending uploads first
-        if let Some(file) = self
-            .uploader
-            .file_by_key(&(dirid, name.to_string()))
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "error looking up id in uploader");
-                NFS3ERR_SERVERFAULT
-            })?
-        {
-            return Ok(Inode::File(file));
-        }
-
         match self
             .vfs
             .inode_by_name_parent(name, dirid)

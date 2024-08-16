@@ -113,36 +113,6 @@ impl<B: Backend + 'static + Sync> Scheduler<B> {
 
         Ok(self.backend.acquire(queue, offset).await?)
     }
-
-    pub async fn file_by_key(&self, key: &B::Key) -> Result<Option<File>> {
-        loop {
-            let notify = {
-                match self.state.read().queues.get(key) {
-                    Some(Status::Ready(queue)) => {
-                        return Ok(Some(queue.file().borrow().clone()));
-                    }
-                    Some(Status::Preparing(notify)) => notify.clone(),
-                    None => return Ok(None),
-                }
-            };
-            notify.notified().await;
-        }
-    }
-
-    pub async fn file_by_id(&self, file_id: u64) -> Result<Option<File>> {
-        let key = {
-            self.state
-                .read()
-                .file_id_keys
-                .get_by_left(&file_id)
-                .map(|k| k.clone())
-        };
-
-        if let Some(key) = key {
-            return self.file_by_key(&key).await;
-        }
-        Ok(None)
-    }
 }
 
 enum Status<B: Backend> {
