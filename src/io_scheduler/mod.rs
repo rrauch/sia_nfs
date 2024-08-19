@@ -1,6 +1,6 @@
 use crate::io_scheduler::queue::{ActiveHandle, Queue};
 use crate::io_scheduler::reaper::Reaper;
-use crate::vfs::File;
+use crate::vfs::inode::File;
 use anyhow::{anyhow, bail, Result};
 use bimap::BiHashMap;
 use parking_lot::RwLock;

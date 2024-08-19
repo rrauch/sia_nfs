@@ -1,5 +1,5 @@
 use crate::io_scheduler::BackendTask;
-use crate::vfs::File;
+use crate::vfs::inode::File;
 use itertools::{Either, Itertools};
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::HashMap;

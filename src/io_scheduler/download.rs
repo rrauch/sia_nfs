@@ -1,6 +1,9 @@
 use crate::io_scheduler::queue::{ActiveHandle, Activity, Queue, WaitHandle};
 use crate::io_scheduler::{Backend, BackendTask, Scheduler};
-use crate::vfs::{File, FileReader, Inode, Vfs};
+use crate::vfs::file_reader::FileReader;
+use crate::vfs::inode::{File, Inode};
+use crate::vfs::Vfs;
+
 use anyhow::bail;
 use anyhow::Result;
 use futures_util::AsyncSeekExt;

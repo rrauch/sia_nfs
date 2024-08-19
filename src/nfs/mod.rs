@@ -1,7 +1,8 @@
 use crate::io_scheduler::download::Download;
 use crate::io_scheduler::upload::Upload;
 use crate::io_scheduler::Scheduler;
-use crate::vfs::{Inode, InodeType, Vfs};
+use crate::vfs::inode::{Inode, InodeType};
+use crate::vfs::Vfs;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

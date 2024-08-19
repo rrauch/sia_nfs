@@ -1,6 +1,8 @@
 use crate::io_scheduler::queue::{ActiveHandle, Activity, Queue};
 use crate::io_scheduler::{Backend, BackendTask, Scheduler};
-use crate::vfs::{File, FileWriter, Inode, Vfs};
+use crate::vfs::file_writer::FileWriter;
+use crate::vfs::inode::{File, Inode};
+use crate::vfs::Vfs;
 use anyhow::bail;
 use itertools::Either;
 use std::num::NonZeroUsize;

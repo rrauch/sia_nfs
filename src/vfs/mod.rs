@@ -1,32 +1,30 @@
+mod cache;
+pub(crate) mod file_reader;
+pub(crate) mod file_writer;
+pub(crate) mod inode;
 mod locking;
 
-use crate::vfs::locking::{LockHolder, LockManager, LockRequest, ReadLock};
+use crate::vfs::cache::CacheManager;
+use crate::vfs::file_reader::FileReader;
+use crate::vfs::file_writer::FileWriter;
+use crate::vfs::inode::{Directory, File, Inode, InodeManager, InodeType};
+use crate::vfs::locking::{LockHolder, LockManager, LockRequest};
 use crate::SqlitePool;
 use anyhow::{anyhow, bail, Result};
 use async_recursion::async_recursion;
-use bimap::BiHashMap;
-use chrono::{DateTime, Utc};
-use futures::{AsyncRead, AsyncSeek, AsyncWrite};
+use chrono::Utc;
+use futures::pin_mut;
 use futures_util::io::Cursor;
-use futures_util::{AsyncWriteExt, StreamExt, TryStreamExt};
+use futures_util::{StreamExt, TryStreamExt};
 use itertools::{Either, Itertools};
-use moka::future::{Cache, CacheBuilder};
 use parking_lot::RwLock;
-use renterd_client::bus::object::RenameMode;
+use renterd_client::bus::object::{Metadata, RenameMode};
 use renterd_client::Client as RenterdClient;
-use sqlx::FromRow;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fmt::{Display, Formatter};
-use std::io::SeekFrom;
 use std::num::NonZeroUsize;
-use std::pin::Pin;
-use std::str::FromStr;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncWrite as TokioAsyncWrite, DuplexStream};
-use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
-use tokio::task::JoinHandle;
+use tokio::sync::{watch, Semaphore};
 use tokio::time::timeout;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::{info, instrument};
@@ -35,22 +33,12 @@ const ROOT_ID: u64 = 1;
 
 pub(crate) struct Vfs {
     renterd: RenterdClient,
-    db: SqlitePool,
+    inode_manager: InodeManager,
     root: Directory,
-    bucket_ids: BiHashMap<u64, String>,
-    buckets: BTreeMap<u64, Directory>,
     download_limiter: Arc<Semaphore>,
     lock_manager: LockManager,
-    inode_cache: Cache<u64, Option<Inode>>,
-    path_inode_id_cache: Cache<(String, String), Option<u64>>,
-    inode_id_path_cache: Cache<u64, Option<(String, String)>>,
-    dir_cache: Cache<u64, Vec<u64>>,
-    pending_writes: Arc<
-        RwLock<(
-            HashMap<u64, HashSet<u64>>,
-            HashMap<u64, watch::Receiver<File>>,
-        )>,
-    >,
+    cache_manager: CacheManager,
+    pending_writes: Arc<PendingWrites>,
 }
 
 impl Vfs {
@@ -64,8 +52,6 @@ impl Vfs {
         T: IntoIterator<Item = I>,
         I: ToString,
     {
-        let root_id = ROOT_ID as i64;
-
         // get all available buckets from renterd
         let available_buckets = renterd
             .bus()
@@ -89,12 +75,7 @@ impl Vfs {
                 if let Some(last_modified) = available_buckets.get(&name) {
                     buckets.insert(
                         name.clone(),
-                        Directory {
-                            id: 0,
-                            name,
-                            parent: ROOT_ID,
-                            last_modified: last_modified.clone(),
-                        },
+                        Directory::new(0, name, last_modified.clone(), ROOT_ID),
                     );
                     Ok(buckets)
                 } else {
@@ -102,125 +83,23 @@ impl Vfs {
                 }
             })?;
 
-        // get the highest known bucket id
-        let mut bucket_id = {
-            sqlx::query!(
-                // sqlx seems unable to determine the type of MAX(id) without the explicit CAST statement
-                "SELECT CAST(MAX(id) AS Integer) AS max_id FROM fs_entries WHERE parent = ?",
-                root_id,
-            )
-            .fetch_one(db.read())
-            .await?
-            .max_id
-            .map(|x| x as u64)
-            .unwrap_or(0)
-            .max(100)
-        };
-        bucket_id += 1;
-
-        // housekeeping
-        let mut tx = db.write().begin().await?;
-        let _ = sqlx::query!(
-            "DELETE FROM fs_entries WHERE id != ? AND parent = ? AND entry_type != 'D'",
-            root_id,
-            root_id
-        )
-        .execute(tx.as_mut())
-        .await?;
-
-        let known_buckets: Vec<String> = sqlx::query!(
-            "SELECT DISTINCT(name) as name FROM fs_entries WHERE parent = ? AND id != ?",
-            root_id,
-            root_id,
-        )
-        .fetch_all(tx.as_mut())
-        .await?
-        .into_iter()
-        .map(|r| r.name)
-        .collect();
-
-        // delete obsolete buckets
-        for bucket in &known_buckets {
-            if !buckets.contains_key(bucket) {
-                let _ = sqlx::query!(
-                    "DELETE FROM fs_entries WHERE name = ? AND parent = ?",
-                    bucket,
-                    root_id
-                )
-                .execute(tx.as_mut())
-                .await?;
-            }
-        }
-
-        // create missing buckets
-        for bucket in buckets.keys() {
-            if !known_buckets.contains(bucket) {
-                let id = bucket_id as i64;
-                let _ = sqlx::query!(
-                    "INSERT INTO fs_entries (id, parent, name, entry_type) VALUES (?, ?, ?, 'D')",
-                    id,
-                    root_id,
-                    bucket
-                )
-                .execute(tx.as_mut())
-                .await?;
-                bucket_id += 1;
-            }
-        }
-        tx.commit().await?;
-
-        // map ids to buckets
-        let bucket_ids: BiHashMap<u64, String> = sqlx::query!(
-            "SELECT id, name FROM fs_entries WHERE parent = ? and id != ? ORDER BY id ASC",
-            root_id,
-            root_id
-        )
-        .fetch_all(db.read())
-        .await?
-        .into_iter()
-        .map(|r| (r.id as u64, r.name))
-        .collect();
-
-        let buckets = buckets
-            .into_iter()
-            .map(|(name, mut dir)| {
-                let id = bucket_ids
-                    .get_by_right(&name)
-                    .expect("bucket is unexplainably missing")
-                    .clone();
-                dir.id = id;
-                (id, dir)
-            })
-            .collect::<BTreeMap<_, _>>();
-
+        let inode_manager = InodeManager::new(db, ROOT_ID, buckets).await?;
         let download_limiter = Arc::new(Semaphore::new(max_concurrent_downloads.get()));
 
         Ok(Self {
             renterd,
-            db,
-            root: Directory {
-                id: ROOT_ID,
-                name: "root".to_string(),
-                last_modified: Utc::now(),
-                parent: ROOT_ID,
-            },
-            buckets,
-            bucket_ids,
+            inode_manager,
+            root: Directory::new(ROOT_ID, "root".to_string(), Utc::now(), ROOT_ID),
             download_limiter,
             lock_manager: LockManager::new(Duration::from_secs(30)),
-            inode_cache: CacheBuilder::new(1000)
-                .support_invalidation_closures()
-                .build(),
-            path_inode_id_cache: CacheBuilder::new(1000)
-                .support_invalidation_closures()
-                .build(),
-            inode_id_path_cache: CacheBuilder::new(1000)
-                .support_invalidation_closures()
-                .build(),
-            dir_cache: CacheBuilder::new(1000)
-                .support_invalidation_closures()
-                .build(),
-            pending_writes: Arc::new(RwLock::new((HashMap::new(), HashMap::new()))),
+            cache_manager: CacheManager::new(
+                10_000,
+                100_000,
+                Duration::from_secs(600),
+                Duration::from_secs(180),
+                Duration::from_secs(10),
+            ),
+            pending_writes: Arc::new(PendingWrites::new()),
         })
     }
 
@@ -236,36 +115,15 @@ impl Vfs {
         let name = name.as_ref();
 
         if parent_id == ROOT_ID {
-            let id = match self.bucket_ids.get_by_right(name) {
-                Some(id) => id.clone(),
-                None => return Ok(None),
-            };
             return Ok(self
-                .buckets
-                .get(&id)
+                .inode_manager
+                .bucket_by_name(name)
                 .map(|dir| Inode::Directory(dir.clone())));
         };
 
         // check pending writes first
-        {
-            let pending_writes = self.pending_writes.read();
-            if let Some(ids) = pending_writes.0.get(&parent_id).map(|e| e.iter()) {
-                if let Some(file) = ids
-                    .map(|id| pending_writes.1.get(id))
-                    .flatten()
-                    .filter_map(|f| {
-                        let file = f.borrow();
-                        if file.name == name {
-                            Some(file.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .next()
-                {
-                    return Ok(Some(Inode::File(file)));
-                }
-            }
+        if let Some(file) = self.pending_writes.by_name_parent(name, parent_id) {
+            return Ok(Some(Inode::File(file)));
         }
 
         let (bucket, path) = self
@@ -292,31 +150,14 @@ impl Vfs {
         parent_path: String,
     ) -> Result<Option<u64>> {
         let path = path.trim_end_matches('/');
-
         let bucket_path = (bucket, path.to_string());
-        self.path_inode_id_cache
-            .try_get_with_by_ref(&bucket_path, async {
-                Ok(
-                    match self
-                        ._inode_by_bucket_path(&bucket_path.0, &bucket_path.1, parent_id)
-                        .await?
-                    {
-                        Some(inode) => {
-                            let id = inode.id();
-                            let path = inode.to_path(&parent_path);
-                            let path = path.trim_end_matches('/');
-                            self.inode_id_path_cache
-                                .insert(id, Some((bucket_path.0.clone(), path.to_string())))
-                                .await;
-                            self.inode_cache.insert(id, Some(inode)).await;
-                            Some(id)
-                        }
-                        None => None,
-                    },
-                )
-            })
+        self.cache_manager
+            .inode_id_by_bucket_path(
+                &bucket_path,
+                &parent_path,
+                self._inode_by_bucket_path(&bucket_path.0, &bucket_path.1, parent_id),
+            )
             .await
-            .map_err(|e: Arc<anyhow::Error>| anyhow::anyhow!(e))
     }
 
     async fn _inode_by_bucket_path(
@@ -361,86 +202,28 @@ impl Vfs {
             InodeType::File
         };
 
-        let id = if let Some(inode) = {
-            let parent_id = parent_id as i64;
-            let name = name.to_string();
-            sqlx::query_as!(
-                InodeRecord,
-                "SELECT id, name, parent, entry_type FROM fs_entries WHERE parent = ? AND name = ?",
-                parent_id,
-                name
-            )
-            .fetch_optional(self.db.read())
-            .await?
-            .map(|r| Inode::try_from(r))
-            .transpose()?
-        } {
-            if inode.inode_type() != inode_type {
-                // the entry type has changed, delete
-                let parent_id = parent_id as i64;
-                let id = inode.id() as i64;
-                sqlx::query!(
-                    "DELETE FROM fs_entries WHERE id = ? and parent = ?",
-                    id,
-                    parent_id
-                )
-                .execute(self.db.write())
-                .await?;
-                None
-            } else {
-                Some(inode.id())
-            }
-        } else {
-            None
-        };
-
-        let id = match id {
-            Some(id) => id,
-            None => {
-                let inode_type = inode_type.as_ref();
-                let parent_id = parent_id as i64;
-                sqlx::query!(
-                    "INSERT INTO fs_entries (name, parent, entry_type) VALUES (?, ?, ?)",
+        Ok(Some(
+            self.inode_manager
+                .sync_by_name_parent(
                     name,
                     parent_id,
                     inode_type,
+                    metadata.size,
+                    metadata.mod_time.to_utc(),
                 )
-                .execute(self.db.write())
-                .await?
-                .last_insert_rowid() as u64
-            }
-        };
-
-        Ok(Some(Inode::new(
-            id,
-            name.to_string(),
-            metadata.size,
-            metadata.mod_time.to_utc(),
-            parent_id,
-            inode_type,
-        )))
+                .await?,
+        ))
     }
 
     pub async fn inode_by_id(&self, id: u64) -> Result<Option<Inode>> {
         // first, check for pending writes
-        {
-            if let Some(file) = {
-                self.pending_writes
-                    .read()
-                    .1
-                    .get(&id)
-                    .map(|e| e.borrow().clone())
-            } {
-                return Ok(Some(Inode::File(file)));
-            }
+        if let Some(file) = self.pending_writes.by_id(id) {
+            return Ok(Some(Inode::File(file)));
         }
 
-        let inode = self
-            .inode_cache
-            .try_get_with(id, async { self._inode_by_id(id).await })
+        self.cache_manager
+            .inode_by_id(id, self._inode_by_id(id))
             .await
-            .map_err(|e: Arc<anyhow::Error>| anyhow::anyhow!(e))?;
-        Ok(inode)
     }
 
     async fn _inode_by_id(&self, id: u64) -> Result<Option<Inode>> {
@@ -449,22 +232,11 @@ impl Vfs {
         }
         if id == ROOT_ID {
             return Ok(Some(Inode::Directory(self.root.clone())));
-        } else if let Some(dir) = self.buckets.get(&id) {
+        } else if let Some(dir) = self.inode_manager.bucket_by_id(id) {
             return Ok(Some(Inode::Directory(dir.clone())));
         }
 
-        let inode = match {
-            let db_id = id as i64;
-            sqlx::query_as!(
-                InodeRecord,
-                "SELECT id, parent, entry_type, name FROM fs_entries WHERE id = ?",
-                db_id
-            )
-            .fetch_optional(self.db.read())
-            .await?
-            .map(|i| Inode::try_from(i))
-            .transpose()
-        }? {
+        let inode = match { self.inode_manager.inode_by_id(id).await? } {
             Some(inode) => inode,
             None => return Ok(None),
         };
@@ -483,20 +255,9 @@ impl Vfs {
         let id = inode.id();
         let is_dir = inode.inode_type() == InodeType::Directory;
         Ok(self
-            .inode_id_path_cache
-            .try_get_with(id, async {
-                Ok(match self._inode_to_bucket_path(inode).await? {
-                    Some(bucket_path) => {
-                        self.path_inode_id_cache
-                            .insert(bucket_path.clone(), Some(id))
-                            .await;
-                        Some(bucket_path)
-                    }
-                    None => None,
-                })
-            })
-            .await
-            .map_err(|e: Arc<anyhow::Error>| anyhow::anyhow!(e))?
+            .cache_manager
+            .inode_to_bucket_path(id, self._inode_to_bucket_path(inode))
+            .await?
             .map(|(bucket, mut path)| {
                 if is_dir && !path.ends_with('/') {
                     path = format!("{}/", path);
@@ -517,29 +278,30 @@ impl Vfs {
             let parent_id;
             match current_inode {
                 Inode::Directory(dir) => {
-                    if dir.id == ROOT_ID {
+                    if dir.id() == ROOT_ID {
                         // reached root
                         break;
                     }
-                    if dir.parent == ROOT_ID {
+                    if dir.parent() == ROOT_ID {
                         // this is the bucket
-                        bucket = Some(dir.name);
+                        bucket = Some(dir.name().to_string());
                         break;
                     } else {
                         if counter == 0 {
                             last_is_dir = true;
                         }
-                        components.push(dir.name);
-                        parent_id = dir.parent;
+                        components.push(dir.name().to_string());
+                        parent_id = dir.parent();
                     }
                 }
                 Inode::File(file) => {
                     assert_ne!(
-                        file.parent, ROOT_ID,
+                        file.parent(),
+                        ROOT_ID,
                         "invalid fs, root can only contain buckets"
                     );
-                    components.push(file.name);
-                    parent_id = file.parent;
+                    components.push(file.name().to_string());
+                    parent_id = file.parent();
                 }
             }
             counter += 1;
@@ -570,14 +332,14 @@ impl Vfs {
     }
 
     pub async fn read_dir(&self, dir: &Directory) -> Result<Vec<Inode>> {
-        if dir.id == ROOT_ID {
+        if dir.id() == ROOT_ID {
             return Ok(self
-                .buckets
-                .values()
+                .inode_manager
+                .buckets()
                 .map(|d| Inode::Directory(d.clone()))
                 .collect::<Vec<_>>());
         }
-        let dir_id = dir.id;
+        let dir_id = dir.id();
         let (bucket, path) = self
             .inode_to_bucket_path(Inode::Directory(dir.clone()))
             .await?
@@ -589,23 +351,17 @@ impl Vfs {
             .await?;
 
         let mut ids = self
-            .dir_cache
-            .try_get_with(dir_id, async { self._read_dir(dir_id, bucket, path).await })
-            .await
-            .map_err(|e: Arc<anyhow::Error>| anyhow::anyhow!(e))?;
+            .cache_manager
+            .read_dir(
+                dir_id,
+                bucket.clone(),
+                path.clone(),
+                self._read_dir(dir_id, bucket, path),
+            )
+            .await?;
 
         // overlay any pending writes
-        {
-            if let Some(mut pending_write_ids) = {
-                self.pending_writes
-                    .read()
-                    .0
-                    .get(&dir_id)
-                    .map(|ids| ids.iter().map(|id| *id).collect_vec())
-            } {
-                ids.append(&mut pending_write_ids);
-            }
-        }
+        ids.extend(self.pending_writes.ids_by_parent(dir_id));
 
         let mut inodes = Vec::with_capacity(ids.len());
         for id in ids {
@@ -618,8 +374,13 @@ impl Vfs {
         Ok(inodes)
     }
 
-    async fn _read_dir(&self, dir_id: u64, bucket: String, path: String) -> Result<Vec<u64>> {
-        let mut stream = match self
+    async fn _read_dir(
+        &self,
+        dir_id: u64,
+        bucket: String,
+        path: String,
+    ) -> Result<(Vec<Inode>, Vec<u64>)> {
+        let stream = match self
             .renterd
             .bus()
             .object()
@@ -636,140 +397,19 @@ impl Vfs {
             Either::Right(stream) => stream,
         };
 
-        let parent = dir_id as i64;
-        let mut obsolete: HashMap<_, _> = sqlx::query_as!(
-            InodeRecord,
-            "SELECT id, name, parent, entry_type FROM fs_entries WHERE parent = ?",
-            parent
-        )
-        .fetch_all(self.db.read())
-        .await?
-        .into_iter()
-        .map(|r| Inode::try_from(r).map(|i| (i.name().to_string(), i)))
-        .try_collect()?;
+        let stream = stream
+            .try_filter_map(|m| async {
+                Ok(Some(
+                    m.into_iter()
+                        .filter_map(|m| Inode::try_from((m, path.as_str(), dir_id)).ok())
+                        .collect_vec(),
+                ))
+            })
+            .map_err(|e| e.into());
 
-        let mut known = vec![];
-        let mut new = vec![];
+        pin_mut!(stream);
 
-        while let Some(metadata) = stream.try_next().await? {
-            for inode in metadata.into_iter().filter_map(|m| {
-                if let Some(name) = m.name.strip_prefix(&path) {
-                    let (name, is_dir) = match name.strip_suffix("/") {
-                        Some(name) => (name, true),
-                        None => (name, false),
-                    };
-                    let mut inode_id = 0u64;
-                    if let Some(inode) = obsolete.remove(name) {
-                        let (id, was_dir) = match inode {
-                            Inode::Directory(dir) => (dir.id, true),
-                            Inode::File(file) => (file.id, false),
-                        };
-                        if is_dir != was_dir {
-                            // an inode with the same name exists, however it has changed type
-                            // better remove the previous entry and replace it with a new one
-                            let inode_type = if was_dir {
-                                InodeType::Directory
-                            } else {
-                                InodeType::File
-                            };
-                            obsolete.insert(
-                                name.to_string(),
-                                Inode::new(id, name.to_string(), 0, Utc::now(), dir_id, inode_type),
-                            );
-                        } else {
-                            // this is a known inode
-                            inode_id = id;
-                        }
-                    }
-                    let inode_type = if is_dir {
-                        InodeType::Directory
-                    } else {
-                        InodeType::File
-                    };
-                    Some(Inode::new(
-                        inode_id,
-                        name.to_string(),
-                        m.size,
-                        m.mod_time.to_utc(),
-                        dir_id,
-                        inode_type,
-                    ))
-                } else {
-                    // it's invalid
-                    None
-                }
-            }) {
-                if inode.id() == 0 {
-                    // this is a new inode
-                    new.push(inode)
-                } else {
-                    // this ia a known inode
-                    let path = inode.to_path(&path);
-                    let id = inode.id();
-                    self.inode_cache.insert(id, Some(inode)).await;
-                    self.inode_id_path_cache
-                        .insert(id, Some((bucket.clone(), path.clone())))
-                        .await;
-                    self.path_inode_id_cache
-                        .insert((bucket.clone(), path), Some(id))
-                        .await;
-                    known.push(id)
-                }
-            }
-        }
-
-        if !new.is_empty() || !obsolete.is_empty() {
-            // something has changed here
-            // update the database accordingly
-            let mut tx = self.db.write().begin().await?;
-            for (_, inode) in obsolete {
-                let id = inode.id() as i64;
-                let _ = sqlx::query!(
-                    "DELETE FROM fs_entries WHERE id = ? AND parent = ?",
-                    id,
-                    parent
-                )
-                .execute(tx.as_mut())
-                .await?;
-
-                let id = inode.id();
-                self.inode_cache.insert(id, None).await;
-                self.inode_id_path_cache.insert(id, None).await;
-                self.path_inode_id_cache
-                    .insert((bucket.clone(), inode.to_path(&path)), None)
-                    .await;
-            }
-            for mut inode in new {
-                let inode_type = inode.inode_type();
-                let inode_type = inode_type.as_ref();
-                let name = inode.name();
-                let id = sqlx::query!(
-                    "INSERT INTO fs_entries (name, parent, entry_type) VALUES (?, ?, ?)",
-                    name,
-                    parent,
-                    inode_type,
-                )
-                .execute(tx.as_mut())
-                .await?
-                .last_insert_rowid();
-                inode.set_id(id as u64);
-
-                let path = inode.to_path(&path);
-                let id = inode.id();
-                self.inode_cache.insert(id, Some(inode)).await;
-                self.inode_id_path_cache
-                    .insert(id, Some((bucket.clone(), path.clone())))
-                    .await;
-                self.path_inode_id_cache
-                    .insert((bucket.clone(), path), Some(id))
-                    .await;
-
-                known.push(id);
-            }
-            tx.commit().await?;
-        }
-
-        Ok(known)
+        self.inode_manager.sync_dir(dir_id, stream).await
     }
 
     pub async fn read_file(&self, file: &File) -> Result<FileReader> {
@@ -779,7 +419,7 @@ impl Vfs {
             .ok_or(anyhow!("invalid file"))?;
 
         // acquire the actual read lock
-        let _read_lock = match self
+        let read_lock = match self
             .lock_manager
             .lock([LockRequest::read(&bucket, &path)])
             .await?
@@ -790,7 +430,7 @@ impl Vfs {
         };
 
         tracing::trace!("waiting for download permit");
-        let _download_permit = timeout(
+        let download_permit = timeout(
             Duration::from_secs(60),
             self.download_limiter.clone().acquire_owned(),
         )
@@ -807,15 +447,13 @@ impl Vfs {
         let size = object.length.ok_or(anyhow!("file size is unknown"))?;
         let stream = object.open_seekable_stream().await?;
 
-        Ok(FileReader {
-            file: file.clone(),
-            offset: 0,
+        Ok(FileReader::new(
+            file.clone(),
             size,
-            stream: Box::new(stream),
-            _read_lock,
-            _download_permit,
-            error_count: 0,
-        })
+            stream,
+            read_lock,
+            download_permit,
+        ))
     }
 
     pub async fn write_file(
@@ -838,7 +476,7 @@ impl Vfs {
         let path = format!("{}{}", parent_path, name);
 
         // lock the paths first
-        let _locks = self
+        let locks = self
             .lock_manager
             .lock([
                 LockRequest::read(&bucket, &parent_path),
@@ -854,48 +492,19 @@ impl Vfs {
             bail!("inode already exists");
         }
 
-        // Ok, this is a bit of a weird part: we need to know the id of the future file before it's even uploaded!
-        // To achieve this, we do a dummy insert into the `fs_entries` table to get an id, then delete it right away
-        // in the same tx. This is a bit of a hack to effectively reserve an id. Later we do a manual insert using
-        // the id we get now.
-        let reserved_id = {
-            let mut tx = self.db.write().begin().await?;
-            let parent_id = parent.id() as i64;
-            let name = name.clone();
-            let id = sqlx::query!(
-                "INSERT INTO fs_entries (name, parent, entry_type) VALUES (?, ?, 'F')",
-                name,
-                parent_id,
-            )
-            .execute(tx.as_mut())
-            .await?
-            .last_insert_rowid() as u64;
-            {
-                let id = id as i64;
-                let _ = sqlx::query!("DELETE FROM fs_entries where id = ?", id)
-                    .execute(tx.as_mut())
-                    .await?;
-            }
-            tx.commit().await?;
-            id
-        };
+        let reserved_id = self.inode_manager.reserve_id(&name, parent.id()).await?;
 
         let file_tx = {
-            let (file_tx, file_rx) = watch::channel(File {
-                id: reserved_id,
-                parent: parent.id(),
-                name: name.clone(),
-                size: 0,
-                last_modified: Utc::now(),
-            });
+            let (file_tx, file_rx) = watch::channel(File::new(
+                reserved_id,
+                name.clone(),
+                0,
+                Utc::now(),
+                parent.id(),
+            ));
 
-            let mut pending_writes = self.pending_writes.write();
-            pending_writes.1.insert(reserved_id, file_rx);
-            pending_writes
-                .0
-                .entry(parent.id)
-                .or_insert_with(|| HashSet::new())
-                .insert(reserved_id);
+            self.pending_writes
+                .insert(reserved_id, parent.id(), file_rx);
             file_tx
         };
 
@@ -915,22 +524,19 @@ impl Vfs {
             })
         };
 
-        Ok(FileWriter {
-            id: reserved_id,
-            vfs: self.clone(),
-            _locks,
+        Ok(FileWriter::new(
+            reserved_id,
+            name,
             bucket,
             path,
-            name,
-            parent: parent.id(),
-            upload_task: Some(upload_task),
-            stream: Some(tx),
-            bytes_written: 0,
-            last_modified: Utc::now(),
-            error_count: 0,
+            parent.id(),
+            self.clone(),
+            locks,
+            upload_task,
+            tx,
             file_tx,
-            pending_writes: self.pending_writes.clone(),
-        })
+            self.pending_writes.clone(),
+        ))
     }
 
     #[instrument(skip(self))]
@@ -978,9 +584,12 @@ impl Vfs {
             )
             .await?;
 
-        self.dir_cache.invalidate(&parent.id).await;
-        self.path_inode_id_cache
-            .invalidate(&(bucket.clone(), path.trim_end_matches('/').to_string()))
+        self.cache_manager
+            .new_dir(
+                bucket.clone(),
+                path.trim_end_matches('/').to_string(),
+                parent.id(),
+            )
             .await;
 
         // looking good
@@ -1068,37 +677,9 @@ impl Vfs {
         affected_ids.insert(inode.id());
 
         // update the database
-        let mut tx = self.db.write().begin().await?;
+        affected_ids.extend(self.inode_manager.delete(inode.id()).await?);
 
-        // first, clean up the temp id table
-        let _ = sqlx::query!("DELETE FROM deleted_fs_entries")
-            .execute(tx.as_mut())
-            .await?;
-
-        // then delete the inode
-        let id = inode.id() as i64;
-        let _ = sqlx::query!("DELETE FROM fs_entries WHERE id = ?", id)
-            .execute(tx.as_mut())
-            .await?;
-
-        // the table has a "ON DELETE CASCADE" constraint, so any child inodes have been automatically deleted
-        // the ids of all deleted items will end up in the temp table (this is done by the delete trigger)
-        sqlx::query!("SELECT id FROM deleted_fs_entries")
-            .fetch_all(tx.as_mut())
-            .await?
-            .into_iter()
-            .for_each(|r| {
-                affected_ids.insert(r.id as u64);
-            });
-
-        // clean up the temp table again
-        let _ = sqlx::query!("DELETE FROM deleted_fs_entries")
-            .execute(tx.as_mut())
-            .await?;
-
-        tx.commit().await?;
-
-        self.invalidate_caches(affected_ids);
+        self.cache_manager.invalidate_caches(affected_ids);
 
         info!("deleted /{}{} ({})", bucket, path, inode.id());
 
@@ -1230,49 +811,15 @@ impl Vfs {
         affected_ids.insert(source.parent());
         affected_ids.insert(target_dir.id());
 
-        let mut tx = self.db.write().begin().await?;
-
         // update db entry
-        let id = source.id() as i64;
-        {
-            let parent = target_dir.id() as i64;
-            sqlx::query!(
-                "UPDATE fs_entries SET name = ?, parent = ? WHERE id = ?",
-                target_name,
-                parent,
-                id
-            )
-            .execute(tx.as_mut())
-            .await?;
-        }
+        affected_ids.extend(
+            self.inode_manager
+                .mv(source.id(), target_dir.id(), target_name)
+                .await?,
+        );
 
-        // find all affected child-inodes
-        sqlx::query!(
-            "WITH RECURSIVE children AS (
-                SELECT id, parent
-                  FROM fs_entries
-                  WHERE parent = ?
-
-                UNION ALL
-
-                SELECT e.id, e.parent
-                  FROM fs_entries e
-                  INNER JOIN children c ON e.parent = c.id
-                  WHERE e.id != c.parent
-            )
-            SELECT DISTINCT(id) FROM children;",
-            id
-        )
-        .fetch_all(tx.as_mut())
-        .await?
-        .into_iter()
-        .for_each(|r| {
-            affected_ids.insert(r.id as u64);
-        });
-
-        tx.commit().await?;
-
-        self.invalidate_caches(affected_ids.into_iter().collect_vec());
+        self.cache_manager
+            .invalidate_caches(affected_ids.into_iter().collect_vec());
 
         info!(
             "mv from /{}{} to /{}{}",
@@ -1281,555 +828,114 @@ impl Vfs {
 
         Ok(())
     }
-
-    fn invalidate_caches<I: IntoIterator<Item = u64>>(&self, inode_ids: I) {
-        let mut inode_ids = inode_ids.into_iter().collect_vec();
-        inode_ids.sort_unstable();
-
-        {
-            let inode_ids = inode_ids.clone();
-            self.dir_cache
-                .invalidate_entries_if(move |k, v| {
-                    inode_ids.contains(k) || v.iter().any(|i| inode_ids.binary_search(i).is_ok())
-                })
-                .expect("unable to invalidate caches using invalidate_entries_if");
-        }
-
-        {
-            let inode_ids = inode_ids.clone();
-            self.inode_cache
-                .invalidate_entries_if(move |k, _| inode_ids.contains(k))
-                .expect("unable to invalidate caches using invalidate_entries_if");
-        }
-
-        {
-            let inode_ids = inode_ids.clone();
-            self.path_inode_id_cache
-                .invalidate_entries_if(move |_, v| match v {
-                    Some(id) => inode_ids.contains(id),
-                    None => true, // make sure to invalidate all `None`s too!
-                })
-                .expect("unable to invalidate caches using invalidate_entries_if");
-        }
-
-        self.inode_id_path_cache
-            .invalidate_entries_if(move |k, _| inode_ids.contains(k))
-            .expect("unable to invalidate caches using invalidate_entries_if");
-    }
 }
 
-pub struct FileReader {
-    file: File,
-    _read_lock: ReadLock,
-    _download_permit: OwnedSemaphorePermit,
-    offset: u64,
-    size: u64,
-    stream: Box<dyn ReadStream + Send + Unpin>,
-    error_count: usize,
-}
+impl TryFrom<(Metadata, &str, u64)> for Inode {
+    type Error = anyhow::Error;
 
-impl FileReader {
-    pub fn file(&self) -> &File {
-        &self.file
-    }
+    fn try_from(
+        (metadata, path, parent_id): (Metadata, &str, u64),
+    ) -> std::result::Result<Self, Self::Error> {
+        let name = match metadata.name.strip_prefix(&path) {
+            Some(name) => name,
+            None => bail!("path does not match name"),
+        };
 
-    pub fn offset(&self) -> u64 {
-        self.offset
-    }
+        let (name, is_dir) = match name.strip_suffix("/") {
+            Some(name) => (name.to_string(), true),
+            None => (name.to_string(), false),
+        };
 
-    pub fn size(&self) -> u64 {
-        self.size
-    }
+        let last_modified = metadata.mod_time.to_utc();
 
-    pub fn eof(&self) -> bool {
-        self.offset == self.size
-    }
-
-    pub fn error_count(&self) -> usize {
-        self.error_count
-    }
-}
-
-trait ReadStream: AsyncRead + AsyncSeek {}
-impl<T: AsyncRead + AsyncSeek> ReadStream for T {}
-
-impl AsyncRead for FileReader {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let result = Pin::new(&mut self.stream).poll_read(cx, buf);
-        if let Poll::Ready(res) = &result {
-            match res {
-                Ok(bytes_read) => {
-                    self.offset += *bytes_read as u64;
-                }
-                Err(_) => {
-                    self.error_count += 1;
-                }
-            }
-        }
-        result
-    }
-}
-
-impl AsyncSeek for FileReader {
-    fn poll_seek(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        pos: SeekFrom,
-    ) -> Poll<std::io::Result<u64>> {
-        let result = Pin::new(&mut self.stream).poll_seek(cx, pos);
-        if let Poll::Ready(res) = &result {
-            match res {
-                Ok(position) => {
-                    self.offset = *position;
-                }
-                Err(_) => {
-                    self.error_count += 1;
-                }
-            }
-        }
-        result
-    }
-}
-
-impl Drop for FileReader {
-    #[instrument(skip(self), name = "file_reader_drop")]
-    fn drop(&mut self) {
-        tracing::debug!(
-            id = self.file.id,
-            name = self.file.name,
-            offset = self.offset,
-            "file_reader closed"
-        );
-    }
-}
-
-pub(crate) struct FileWriter {
-    id: u64,
-    name: String,
-    parent: u64,
-    bucket: String,
-    path: String,
-    stream: Option<DuplexStream>,
-    _locks: Vec<LockHolder>,
-    upload_task: Option<JoinHandle<std::result::Result<(), renterd_client::Error>>>,
-    vfs: Arc<Vfs>,
-    bytes_written: u64,
-    last_modified: DateTime<Utc>,
-    error_count: usize,
-    file_tx: watch::Sender<File>,
-    pending_writes: Arc<
-        RwLock<(
-            HashMap<u64, HashSet<u64>>,
-            HashMap<u64, watch::Receiver<File>>,
-        )>,
-    >,
-}
-
-impl AsyncWrite for FileWriter {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let result = Pin::new(self.stream()?).poll_write(cx, buf);
-        if let Poll::Ready(res) = &result {
-            match res {
-                Ok(bytes_written) => {
-                    self.bytes_written += *bytes_written as u64;
-                }
-                Err(_) => {
-                    self.error_count += 1;
-                }
-            }
-            self.update_file();
-        }
-        result
-    }
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let result = Pin::new(self.stream()?).poll_flush(cx);
-        if let Poll::Ready(res) = &result {
-            if let Err(_) = res {
-                self.error_count += 1;
-            }
-            self.update_file();
-        }
-        result
-    }
-    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let result = Pin::new(self.stream()?).poll_shutdown(cx);
-        if let Poll::Ready(res) = &result {
-            match res {
-                Ok(()) => {
-                    // was properly closed, discard stream
-                    let _ = self.stream.take();
-                    tracing::debug!("FileWriter for /{}{} closed", self.bucket, self.path);
-                }
-                Err(_) => {
-                    self.error_count += 1;
-                }
-            }
-            self.update_file();
-        }
-        result
-    }
-}
-
-impl FileWriter {
-    fn stream(&mut self) -> std::io::Result<&mut DuplexStream> {
-        self.stream.as_mut().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "stream already closed")
-        })
-    }
-
-    pub fn file_id(&self) -> u64 {
-        self.id
-    }
-
-    pub fn parent_id(&self) -> u64 {
-        self.parent
-    }
-
-    pub fn name(&self) -> &str {
-        self.name.as_str()
-    }
-
-    pub fn bucket(&self) -> &str {
-        self.bucket.as_str()
-    }
-
-    pub fn path(&self) -> &str {
-        self.path.as_str()
-    }
-
-    pub fn bytes_written(&self) -> u64 {
-        self.bytes_written
-    }
-
-    pub fn error_count(&self) -> usize {
-        self.error_count
-    }
-
-    pub fn is_closed(&self) -> bool {
-        self.stream.is_none()
-    }
-
-    pub fn to_file(&self) -> File {
-        File {
-            id: self.id,
-            parent: self.parent,
-            name: self.name.clone(),
-            size: self.bytes_written,
-            last_modified: self.last_modified,
-        }
-    }
-
-    fn update_file(&self) {
-        let mut file = self.file_tx.borrow().clone();
-        file.size = self.bytes_written;
-        file.last_modified = Utc::now();
-        let _ = self.file_tx.send(file);
-    }
-
-    pub async fn finalize(mut self) -> Result<File> {
-        if !self.is_closed() {
-            // stream has not been closed yet
-            self.close().await?;
-        }
-
-        // wait for the upload task to finish
-        self.upload_task
-            .take()
-            .expect("JoinHandle went missing")
-            .await??;
-
-        // add the new file to the db using the id we previously "reserved"
-        {
-            let id = self.id as i64;
-            let parent_id = self.parent as i64;
-            let name = self.name.clone();
-            let _ = sqlx::query!(
-                "INSERT INTO fs_entries (id, name, parent, entry_type) VALUES (?, ?, ?, 'F')",
-                id,
+        if is_dir {
+            Ok(Inode::Directory(Directory::new(
+                0,
                 name,
+                last_modified,
                 parent_id,
-            )
-            .execute(self.vfs.db.write())
-            .await?;
+            )))
+        } else {
+            Ok(Inode::File(File::new(
+                0,
+                name,
+                metadata.size,
+                last_modified,
+                parent_id,
+            )))
         }
-
-        // update caches
-        self.vfs.inode_cache.invalidate(&self.id).await;
-        self.vfs.inode_id_path_cache.invalidate(&self.id).await;
-        self.vfs.dir_cache.invalidate(&self.parent_id()).await;
-
-        let file = match self
-            .vfs
-            .inode_by_name_parent(&self.name, self.parent)
-            .await?
-        {
-            Some(Inode::File(file)) => Ok(file),
-            _ => Err(anyhow!("uploaded inode invalid")),
-        }?;
-
-        let (bucket, path) = self
-            .vfs
-            .inode_to_bucket_path(Inode::File(file.clone()))
-            .await?
-            .ok_or(anyhow!("uploaded inode invalid"))?;
-
-        self.vfs
-            .path_inode_id_cache
-            .invalidate(&(bucket, path))
-            .await;
-
-        Ok(file)
     }
 }
 
-impl Drop for FileWriter {
-    fn drop(&mut self) {
-        if !self.is_closed() {
-            tracing::warn!(
-                "FileWriter for /{}{} dropped before closing, data corruption possible!",
-                self.bucket,
-                self.path
-            );
+struct PendingWrites {
+    data: RwLock<(
+        HashMap<u64, HashSet<u64>>,
+        HashMap<u64, watch::Receiver<File>>,
+    )>,
+}
+
+impl PendingWrites {
+    fn new() -> Self {
+        Self {
+            data: RwLock::new((HashMap::new(), HashMap::new())),
         }
-        if let Some(upload_task) = self.upload_task.take() {
-            upload_task.abort();
-            tracing::warn!(
-                "upload_task for /{}{} had to be aborted, data corruption possible!",
-                self.bucket,
-                self.path
-            )
+    }
+
+    pub fn by_name_parent(&self, name: &str, parent_id: u64) -> Option<File> {
+        let pending_writes = self.data.read();
+        if let Some(ids) = pending_writes.0.get(&parent_id).map(|e| e.iter()) {
+            if let Some(file) = ids
+                .map(|id| pending_writes.1.get(id))
+                .flatten()
+                .filter_map(|f| {
+                    let file = f.borrow();
+                    if file.name() == name {
+                        Some(file.clone())
+                    } else {
+                        None
+                    }
+                })
+                .next()
+            {
+                return Some(file);
+            }
         }
-        let mut pending_writes = self.pending_writes.write();
-        pending_writes.1.remove(&self.id);
+        None
+    }
+
+    pub fn by_id(&self, id: u64) -> Option<File> {
+        self.data.read().1.get(&id).map(|e| e.borrow().clone())
+    }
+
+    pub fn ids_by_parent(&self, parent_id: u64) -> Vec<u64> {
+        self.data
+            .read()
+            .0
+            .get(&parent_id)
+            .map(|ids| ids.iter().map(|id| *id).collect())
+            .unwrap_or_else(|| vec![])
+    }
+
+    pub fn insert(&self, reserved_id: u64, parent_id: u64, file_rx: watch::Receiver<File>) {
+        let mut pending_writes = self.data.write();
+        pending_writes.1.insert(reserved_id, file_rx);
+        pending_writes
+            .0
+            .entry(parent_id)
+            .or_insert_with(|| HashSet::new())
+            .insert(reserved_id);
+    }
+
+    pub fn remove(&self, reserved_id: u64, parent_id: u64) {
+        let mut pending_writes = self.data.write();
+        pending_writes.1.remove(&reserved_id);
         let mut keep = false;
-        if let Some(e) = pending_writes.0.get_mut(&self.parent) {
-            e.remove(&self.id);
+        if let Some(e) = pending_writes.0.get_mut(&parent_id) {
+            e.remove(&reserved_id);
             keep = !e.is_empty();
         };
         if !keep {
-            pending_writes.0.remove(&self.parent);
+            pending_writes.0.remove(&parent_id);
         }
-    }
-}
-
-#[derive(PartialEq, Clone)]
-pub enum InodeType {
-    Directory,
-    File,
-}
-
-impl Display for InodeType {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_ref())
-    }
-}
-
-impl AsRef<str> for InodeType {
-    fn as_ref(&self) -> &str {
-        match self {
-            InodeType::Directory => "D",
-            InodeType::File => "F",
-        }
-    }
-}
-
-impl FromStr for InodeType {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        if s.eq_ignore_ascii_case("D") {
-            Ok(InodeType::Directory)
-        } else if s.eq_ignore_ascii_case("F") {
-            Ok(InodeType::File)
-        } else {
-            Err(anyhow!("Invalid inode type `{}`", s))
-        }
-    }
-}
-
-#[derive(PartialEq, Clone, Debug)]
-pub(crate) struct Directory {
-    id: u64,
-    name: String,
-    last_modified: DateTime<Utc>,
-    parent: u64,
-}
-
-impl Directory {
-    pub fn id(&self) -> u64 {
-        self.id
-    }
-
-    fn set_id(&mut self, id: u64) {
-        self.id = id;
-    }
-
-    pub fn name(&self) -> &str {
-        self.name.as_str()
-    }
-
-    pub fn last_modified(&self) -> &DateTime<Utc> {
-        &self.last_modified
-    }
-
-    pub fn parent(&self) -> u64 {
-        self.parent
-    }
-}
-
-#[derive(PartialEq, Clone, Debug)]
-pub(crate) struct File {
-    id: u64,
-    name: String,
-    size: u64,
-    last_modified: DateTime<Utc>,
-    parent: u64,
-}
-
-impl File {
-    pub fn id(&self) -> u64 {
-        self.id
-    }
-
-    fn set_id(&mut self, id: u64) {
-        self.id = id;
-    }
-
-    pub fn name(&self) -> &str {
-        self.name.as_str()
-    }
-
-    pub fn size(&self) -> u64 {
-        self.size
-    }
-
-    pub fn last_modified(&self) -> &DateTime<Utc> {
-        &self.last_modified
-    }
-
-    pub fn parent(&self) -> u64 {
-        self.parent
-    }
-}
-
-#[derive(PartialEq, Clone, Debug)]
-pub(crate) enum Inode {
-    Directory(Directory),
-    File(File),
-}
-
-impl Inode {
-    fn new(
-        id: u64,
-        name: String,
-        size: u64,
-        last_modified: DateTime<Utc>,
-        parent: u64,
-        inode_type: InodeType,
-    ) -> Self {
-        match inode_type {
-            InodeType::Directory => Inode::Directory(Directory {
-                id,
-                name,
-                last_modified,
-                parent,
-            }),
-            InodeType::File => Inode::File(File {
-                id,
-                name,
-                size,
-                last_modified,
-                parent,
-            }),
-        }
-    }
-
-    pub fn id(&self) -> u64 {
-        match &self {
-            Inode::File(file) => file.id(),
-            Inode::Directory(dir) => dir.id(),
-        }
-    }
-
-    fn set_id(&mut self, id: u64) {
-        match self {
-            Inode::File(file) => file.set_id(id),
-            Inode::Directory(dir) => dir.set_id(id),
-        }
-    }
-
-    pub fn name(&self) -> &str {
-        match &self {
-            Inode::File(file) => file.name(),
-            Inode::Directory(dir) => dir.name(),
-        }
-    }
-
-    pub fn parent(&self) -> u64 {
-        match self {
-            Inode::File(file) => file.parent(),
-            Inode::Directory(dir) => dir.parent(),
-        }
-    }
-
-    pub fn inode_type(&self) -> InodeType {
-        match &self {
-            Inode::File(_) => InodeType::File,
-            Inode::Directory(_) => InodeType::Directory,
-        }
-    }
-
-    pub fn last_modified(&self) -> &DateTime<Utc> {
-        match self {
-            Inode::File(file) => file.last_modified(),
-            Inode::Directory(dir) => dir.last_modified(),
-        }
-    }
-
-    pub fn size(&self) -> Option<u64> {
-        match self {
-            Inode::File(file) => Some(file.size()),
-            Inode::Directory(_) => None,
-        }
-    }
-
-    fn to_path(&self, parent_path: &str) -> String {
-        let tail = if self.inode_type() == InodeType::Directory {
-            "/"
-        } else {
-            ""
-        };
-        format!("{}{}{}", parent_path, self.name(), tail)
-    }
-}
-
-#[derive(FromRow)]
-struct InodeRecord {
-    id: i64,
-    name: String,
-    parent: i64,
-    entry_type: String,
-}
-
-impl TryFrom<InodeRecord> for Inode {
-    type Error = anyhow::Error;
-
-    fn try_from(r: InodeRecord) -> std::result::Result<Self, Self::Error> {
-        let inode_type = InodeType::from_str(r.entry_type.as_str())?;
-        Ok(Inode::new(
-            r.id as u64,
-            r.name,
-            0,
-            Utc::now(),
-            r.parent as u64,
-            inode_type,
-        ))
     }
 }
