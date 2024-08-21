@@ -11,7 +11,7 @@ pub(super) struct CacheManager {
     inode_cache: Cache<u64, Option<Inode>>,
     path_inode_id_cache: Cache<(String, String), Option<u64>>,
     inode_id_path_cache: Cache<u64, Option<(String, String)>>,
-    dir_cache: Cache<u64, Vec<u64>>,
+    dir_cache: Cache<u64, Vec<Inode>>,
 }
 
 impl CacheManager {
@@ -114,25 +114,23 @@ impl CacheManager {
         bucket: String,
         path: String,
         init: impl Future<Output = Result<(Vec<Inode>, Vec<u64>)>>,
-    ) -> Result<Vec<u64>> {
+    ) -> Result<Vec<Inode>> {
         self.dir_cache
             .try_get_with(dir_id, async {
                 let (inodes, obsolete_ids) = init.await?;
                 self.invalidate_caches(obsolete_ids);
-                let mut ids = Vec::with_capacity(inodes.len());
-                for inode in inodes {
+                for inode in &inodes {
                     let path = inode.to_path(&path);
                     let id = inode.id();
-                    self.inode_cache.insert(id, Some(inode)).await;
+                    self.inode_cache.insert(id, Some(inode.clone())).await;
                     self.inode_id_path_cache
                         .insert(id, Some((bucket.clone(), path.clone())))
                         .await;
                     self.path_inode_id_cache
                         .insert((bucket.clone(), path), Some(id))
                         .await;
-                    ids.push(id);
                 }
-                Ok(ids)
+                Ok(inodes)
             })
             .await
             .map_err(|e: Arc<anyhow::Error>| anyhow::anyhow!(e))
@@ -162,7 +160,8 @@ impl CacheManager {
             let inode_ids = inode_ids.clone();
             self.dir_cache
                 .invalidate_entries_if(move |k, v| {
-                    inode_ids.contains(k) || v.iter().any(|i| inode_ids.binary_search(i).is_ok())
+                    inode_ids.contains(k)
+                        || v.iter().any(|i| inode_ids.binary_search(&i.id()).is_ok())
                 })
                 .expect("unable to invalidate caches using invalidate_entries_if");
         }

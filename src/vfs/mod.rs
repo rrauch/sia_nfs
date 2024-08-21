@@ -350,7 +350,7 @@ impl Vfs {
             .lock([LockRequest::read(&bucket, &path)])
             .await?;
 
-        let mut ids = self
+        let mut inodes = self
             .cache_manager
             .read_dir(
                 dir_id,
@@ -361,16 +361,13 @@ impl Vfs {
             .await?;
 
         // overlay any pending writes
-        ids.extend(self.pending_writes.ids_by_parent(dir_id));
+        inodes.extend(
+            self.pending_writes
+                .by_parent(dir_id)
+                .into_iter()
+                .map(|f| Inode::File(f)),
+        );
 
-        let mut inodes = Vec::with_capacity(ids.len());
-        for id in ids {
-            inodes.push(
-                self.inode_by_id(id)
-                    .await?
-                    .ok_or(anyhow!("inode {} not found", id))?,
-            );
-        }
         Ok(inodes)
     }
 
@@ -907,12 +904,17 @@ impl PendingWrites {
         self.data.read().1.get(&id).map(|e| e.borrow().clone())
     }
 
-    pub fn ids_by_parent(&self, parent_id: u64) -> Vec<u64> {
-        self.data
-            .read()
+    pub fn by_parent(&self, parent_id: u64) -> Vec<File> {
+        let pending_writes = self.data.read();
+        pending_writes
             .0
             .get(&parent_id)
-            .map(|ids| ids.iter().map(|id| *id).collect())
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| pending_writes.1.get(id).map(|e| Some(e.borrow().clone())))
+                    .collect()
+            })
+            .flatten()
             .unwrap_or_else(|| vec![])
     }
 
