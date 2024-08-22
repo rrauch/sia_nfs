@@ -432,6 +432,7 @@ impl Vfs {
             self.download_limiter.clone().acquire_owned(),
         )
         .await??;
+        tracing::trace!("download permit acquired");
 
         let object = self
             .renterd
@@ -729,6 +730,11 @@ impl Vfs {
             bail!("cannot move between buckets");
         }
 
+        let rename_mode = match source.inode_type() {
+            InodeType::File => RenameMode::Single,
+            InodeType::Directory => RenameMode::Multi,
+        };
+
         let tail = if source.inode_type() == InodeType::Directory {
             "/"
         } else {
@@ -782,7 +788,7 @@ impl Vfs {
                 .try_next()
                 .await
             {
-                Ok(Some(_)) => true,
+                Ok(Some(metadata)) => metadata.iter().find(|m| m.name == target_path).is_some(),
                 _ => false,
             }
         } {
@@ -799,7 +805,7 @@ impl Vfs {
                 target_path.clone(),
                 bucket.clone(),
                 true,
-                RenameMode::Multi,
+                rename_mode,
             )
             .await?;
 

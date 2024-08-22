@@ -544,7 +544,7 @@ impl File {
     }
 
     pub(super) fn set_size(&mut self, size: u64) {
-        self.size = self.size;
+        self.size = size;
     }
 
     pub fn last_modified(&self) -> &DateTime<Utc> {
