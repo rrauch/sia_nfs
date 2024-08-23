@@ -7,6 +7,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures_util::{AsyncReadExt, AsyncWriteExt};
+use moka::future::{Cache, CacheBuilder};
 use nfsserve::nfs::nfsstat3::{
     NFS3ERR_IO, NFS3ERR_ISDIR, NFS3ERR_NOENT, NFS3ERR_NOTDIR, NFS3ERR_NOTSUPP, NFS3ERR_SERVERFAULT,
 };
@@ -14,24 +15,16 @@ use nfsserve::nfs::{
     fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3,
 };
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
-use parking_lot::Mutex;
-use std::collections::HashMap;
-use std::future::Future;
-use std::hash::Hash;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::broadcast;
-use tokio::task::JoinHandle;
 use tracing::instrument;
-use xxhash_rust::xxh3::Xxh3;
 
 pub(crate) struct SiaNfsFs {
     vfs: Arc<Vfs>,
     downloader: Scheduler<Download>,
     uploader: Scheduler<Upload>,
-    read_coalescer: RequestCoalescer<(fileid3, u64, u32), Result<(Vec<u8>, bool), nfsstat3>>,
-    write_coalescer: RequestCoalescer<(fileid3, u64, usize, u64), Result<fattr3, nfsstat3>>,
+    read_cache: Option<Cache<(fileid3, u64, u32), (Vec<u8>, bool)>>,
 }
 
 impl SiaNfsFs {
@@ -44,6 +37,7 @@ impl SiaNfsFs {
         download_max_inactivity_for_match: Duration,
         upload_initial_idle: Duration,
         upload_max_idle: Duration,
+        read_cache: Option<(u64, Duration, Duration)>,
     ) -> Self {
         let downloader = Download::new(
             vfs.clone(),
@@ -58,8 +52,12 @@ impl SiaNfsFs {
             downloader,
             uploader,
             vfs,
-            read_coalescer: RequestCoalescer::new(),
-            write_coalescer: RequestCoalescer::new(),
+            read_cache: read_cache.map(|(max_capacity, ttl, tti)| {
+                CacheBuilder::new(max_capacity)
+                    .time_to_live(ttl)
+                    .time_to_idle(tti)
+                    .build()
+            }),
         }
     }
 
@@ -112,32 +110,6 @@ impl SiaNfsFs {
 
         Ok((buf, dl.eof()))
     }
-
-    async fn _write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
-        let file = match self.inode_by_id(id).await? {
-            Inode::File(file) => file,
-            Inode::Directory(_) => return Err(NFS3ERR_ISDIR),
-        };
-
-        let mut upload = self
-            .uploader
-            .acquire(file.id(), offset)
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "failed to acquire upload handle for {}", file.id());
-                NFS3ERR_NOENT
-            })?;
-        let upload = upload.as_mut();
-
-        upload.write_all(data).await.map_err(|e| {
-            tracing::error!(error = %e, "write error");
-            NFS3ERR_IO
-        })?;
-
-        tracing::debug!(file = ?file, offset = offset, data = data.len(), "write complete");
-
-        Ok(to_fattr3(&Inode::File(upload.to_file())))
-    }
 }
 
 #[async_trait]
@@ -171,23 +143,40 @@ impl NFSFileSystem for SiaNfsFs {
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
-        self.read_coalescer
-            .coalesce((id, offset, count), self._read(id, offset, count))
-            .await
+        match &self.read_cache {
+            Some(cache) => cache
+                .try_get_with((id, offset, count), self._read(id, offset, count))
+                .await
+                .map_err(|e| e.as_ref().clone()),
+            None => self._read(id, offset, count).await,
+        }
     }
 
     #[instrument(skip(self, data), fields(count = data.len()))]
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
-        let mut xxh3 = Xxh3::with_seed(data.len() as u64);
-        xxh3.update(data);
-        let data_hash = xxh3.digest();
+        let file = match self.inode_by_id(id).await? {
+            Inode::File(file) => file,
+            Inode::Directory(_) => return Err(NFS3ERR_ISDIR),
+        };
 
-        self.write_coalescer
-            .coalesce(
-                (id, offset, data.len(), data_hash),
-                self._write(id, offset, data),
-            )
+        let mut upload = self
+            .uploader
+            .acquire(file.id(), offset)
             .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to acquire upload handle for {}", file.id());
+                NFS3ERR_NOENT
+            })?;
+        let upload = upload.as_mut();
+
+        upload.write_all(data).await.map_err(|e| {
+            tracing::error!(error = %e, "write error");
+            NFS3ERR_IO
+        })?;
+
+        tracing::debug!(file = ?file, offset = offset, data = data.len(), "write complete");
+
+        Ok(to_fattr3(&Inode::File(upload.to_file())))
     }
 
     async fn create(
@@ -426,78 +415,4 @@ fn to_nfsstime(date_time: &DateTime<Utc>) -> nfstime3 {
 
 fn to_str(name: &filename3) -> Result<&str, nfsstat3> {
     Ok(std::str::from_utf8(name).map_err(|_| NFS3ERR_SERVERFAULT)?)
-}
-
-struct RequestCoalescer<K, V>
-where
-    K: Eq + Hash + Send + 'static,
-    V: Clone + Send + Sync + 'static,
-{
-    inflight: Arc<Mutex<HashMap<K, Weak<broadcast::Sender<Arc<V>>>>>>,
-    _gc: JoinHandle<()>,
-}
-
-impl<K, V> RequestCoalescer<K, V>
-where
-    K: Eq + Hash + Send + 'static,
-    V: Clone + Send + Sync + 'static,
-{
-    fn new() -> Self {
-        let inflight = Arc::new(Mutex::new(HashMap::new()));
-        let _gc = {
-            let inflight = inflight.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(60)).await;
-                    {
-                        let mut inflight = inflight.lock();
-                        inflight.retain(|_, v| Weak::strong_count(&v) > 0);
-                    }
-                }
-            })
-        };
-        Self { inflight, _gc }
-    }
-
-    async fn coalesce(&self, key: K, fut: impl Future<Output = V>) -> V {
-        let (mut rx, tx) = {
-            let mut inflight = self.inflight.lock();
-            let entry = inflight.entry(key).or_default();
-            match entry.upgrade() {
-                Some(sender) => (sender.subscribe(), None),
-                None => {
-                    let (tx, rx) = broadcast::channel(1);
-                    let tx = Arc::new(tx);
-                    *entry = Arc::downgrade(&tx);
-                    (rx, Some(tx))
-                }
-            }
-        };
-        {
-            if let Some(tx) = tx {
-                let _ = tx.send(Arc::new(fut.await));
-            }
-        }
-
-        let res = rx
-            .recv()
-            .await
-            .expect("coalesce receive error, should never happen");
-        drop(rx);
-
-        Arc::try_unwrap(res).unwrap_or_else(|arc| {
-            tracing::trace!("request was coalesced");
-            arc.as_ref().clone()
-        })
-    }
-}
-
-impl<K, V> Drop for RequestCoalescer<K, V>
-where
-    K: Eq + Hash + Send + 'static,
-    V: Clone + Send + Sync + 'static,
-{
-    fn drop(&mut self) {
-        self._gc.abort();
-    }
 }
