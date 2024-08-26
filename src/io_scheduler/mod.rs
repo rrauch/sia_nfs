@@ -1,65 +1,131 @@
 use crate::io_scheduler::queue::{ActiveHandle, Queue};
-use crate::io_scheduler::reaper::Reaper;
 use anyhow::{anyhow, bail, Result};
 use bimap::BiHashMap;
+use futures_util::FutureExt;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::future::Future;
 use std::hash::Hash;
 use std::sync::Arc;
-use tokio::sync::Notify;
+use std::time::{Duration, SystemTime};
+use tokio::sync::{mpsc, Notify};
+use tokio::task::JoinHandle;
+use tracing::instrument;
 
 pub(crate) mod download;
 mod queue;
-mod reaper;
 pub(crate) mod upload;
 
-pub(crate) struct Scheduler<B: Backend> {
-    backend: B,
+pub(crate) struct Scheduler<RM: ResourceManager>
+where
+    <RM as ResourceManager>::Resource: 'static,
+{
+    resource_manager: Arc<RM>,
     allow_existing_queue: bool,
-    state: Arc<RwLock<State<B>>>,
-    reaper: Reaper<B>,
+    max_queue_idle: Duration,
+    max_resource_idle: Duration,
+    max_prep_errors: usize,
+    state: Arc<RwLock<State<RM>>>,
+    term_tx: mpsc::Sender<RM::PreparationKey>,
+    _reaper: JoinHandle<()>,
 }
 
-struct State<B: Backend> {
-    queues: HashMap<B::PreparationKey, Status<B>>,
-    key_map: BiHashMap<B::PreparationKey, B::AccessKey>,
+struct State<RM: ResourceManager>
+where
+    <RM as ResourceManager>::Resource: 'static,
+{
+    queues: HashMap<RM::PreparationKey, Status<RM>>,
+    key_map: BiHashMap<RM::PreparationKey, RM::AccessKey>,
 }
 
-impl<B: Backend + 'static + Sync> Scheduler<B> {
-    fn new(backend: B, allow_existing_queue: bool) -> Self {
+impl<RM: ResourceManager + 'static + Send + Sync> Scheduler<RM> {
+    fn new(
+        resource_manager: RM,
+        allow_existing_queue: bool,
+        max_queue_idle: Duration,
+        max_resource_idle: Duration,
+        max_prep_errors: usize,
+    ) -> Self {
         let state = Arc::new(RwLock::new(State {
             queues: HashMap::new(),
             key_map: BiHashMap::new(),
         }));
-        let reaper: Reaper<B> = Reaper::new(state.clone());
+
+        let (term_tx, mut term_rx) = mpsc::channel(10);
+
+        let _reaper = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                while let Some(preparation_key) = term_rx.recv().await {
+                    let queue = {
+                        let state = &mut state.write();
+                        state.key_map.remove_by_left(&preparation_key);
+                        if let Some(Status::Ready(queue)) = state.queues.remove(&preparation_key) {
+                            Some(queue)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(mut queue) = queue {
+                        tokio::spawn(async move {
+                            tracing::debug!("shutting down queue {:?}", preparation_key);
+                            let queue = loop {
+                                match Arc::try_unwrap(queue) {
+                                    Ok(queue) => break queue,
+                                    Err(arc_queue) => {
+                                        queue = arc_queue;
+                                        tokio::time::sleep(Duration::from_millis(250)).await;
+                                    }
+                                }
+                            };
+                            queue.shutdown().await;
+                            tracing::trace!("queue {:?} shutdown complete", preparation_key);
+                        });
+                    }
+                }
+            })
+        };
 
         Self {
-            backend,
+            resource_manager: Arc::new(resource_manager),
             allow_existing_queue,
+            max_queue_idle,
+            max_resource_idle,
+            max_prep_errors,
             state,
-            reaper,
+            term_tx,
+            _reaper,
         }
     }
 
-    pub async fn prepare(&self, preparation_key: &B::PreparationKey) -> Result<B::AccessKey> {
+    pub async fn prepare(&self, preparation_key: &RM::PreparationKey) -> Result<RM::AccessKey> {
         loop {
             let (notify, fut) = {
-                let queues = &mut self.state.write().queues;
-                match queues.get(preparation_key) {
+                let state = &mut self.state.write();
+                match state.queues.get(preparation_key) {
                     None => {
                         let notify_ready = Arc::new(Notify::new());
-                        queues.insert(
+                        state.queues.insert(
                             preparation_key.clone(),
                             Status::Preparing(notify_ready.clone()),
                         );
-                        (notify_ready, Some(self.backend.prepare(preparation_key)))
+                        (
+                            notify_ready,
+                            Some(self.resource_manager.prepare(preparation_key)),
+                        )
                     }
                     Some(Status::Preparing(notify)) => (notify.clone(), None),
-                    Some(Status::Ready(queue)) => {
+                    Some(Status::Ready(_)) => {
                         if self.allow_existing_queue {
-                            return Ok(queue.access_key().clone());
+                            return state
+                                .key_map
+                                .get_by_left(preparation_key)
+                                .map(|k| k.clone())
+                                .ok_or(anyhow!(
+                                    "unable to find access key for preparation key {:?}",
+                                    preparation_key
+                                ));
                         } else {
                             bail!(
                                 "queue for preparation_key {:?} already exists",
@@ -75,15 +141,35 @@ impl<B: Backend + 'static + Sync> Scheduler<B> {
                 let mut state = self.state.write();
                 notify.notify_waiters();
                 return match res {
-                    Ok(queue) => {
-                        let access_key = queue.access_key().clone();
+                    Ok((access_key, resource_data, advise_data, initial_resources)) => {
+                        let term_fn = {
+                            let preparation_key = preparation_key.clone();
+                            let term_tx = self.term_tx.clone();
+                            || {
+                                async move {
+                                    if let Err(err) = term_tx.send(preparation_key).await {
+                                        tracing::error!(error = %err, "error sending queue termination message to reaper")
+                                    }
+                                }
+                                .boxed()
+                            }
+                        };
+
+                        let queue = Queue::new(
+                            self.resource_manager.clone(),
+                            resource_data,
+                            advise_data,
+                            initial_resources,
+                            self.max_queue_idle,
+                            self.max_resource_idle,
+                            self.max_prep_errors,
+                            Some(term_fn),
+                        );
                         state
                             .queues
                             .insert(preparation_key.clone(), Status::Ready(Arc::new(queue)));
                         let key_map = &mut state.key_map;
                         key_map.insert(preparation_key.clone(), access_key.clone());
-                        // let the reaper know there's a new queue
-                        self.reaper.notify();
                         Ok(access_key)
                     }
                     Err(err) => {
@@ -99,11 +185,13 @@ impl<B: Backend + 'static + Sync> Scheduler<B> {
         }
     }
 
+    #[instrument(skip(self))]
     pub async fn access(
         &self,
-        access_key: &B::AccessKey,
+        access_key: &RM::AccessKey,
         offset: u64,
-    ) -> Result<ActiveHandle<B::Task>> {
+    ) -> Result<ActiveHandle<RM::Resource>> {
+        tracing::trace!("access request");
         let queue = {
             let state = self.state.read();
             let preparation_key = state.key_map.get_by_right(access_key).ok_or_else(|| {
@@ -121,36 +209,141 @@ impl<B: Backend + 'static + Sync> Scheduler<B> {
             queue.clone()
         };
 
-        Ok(self.backend.access(queue, offset).await?)
+        let resp = queue.access(offset).await;
+        tracing::trace!(success = resp.is_ok(), "access response");
+        Ok(resp?)
     }
 }
 
-enum Status<B: Backend> {
+enum Status<RM: ResourceManager>
+where
+    <RM as ResourceManager>::Resource: 'static,
+{
     Preparing(Arc<Notify>),
-    Ready(Arc<Queue<B::AccessKey, B::Task, B::Data>>),
+    Ready(Arc<Queue<RM>>),
 }
 
-pub(crate) trait Backend: Sized {
-    type Task: BackendTask;
+pub(crate) trait ResourceManager: Sized {
+    type Resource: Resource;
     type PreparationKey: Hash + Eq + Clone + Send + 'static + Sync + Debug;
     type AccessKey: Hash + Eq + Clone + Send + 'static + Sync + Debug;
-    type Data: Send + Sync + 'static;
+    type ResourceData: Send + Sync + 'static;
+    type AdviseData: Send + Sync + 'static;
 
     fn prepare(
         &self,
         preparation_key: &Self::PreparationKey,
-    ) -> impl Future<Output = Result<Queue<Self::AccessKey, Self::Task, Self::Data>>> + Send;
+    ) -> impl Future<
+        Output = Result<(
+            Self::AccessKey,
+            Self::ResourceData,
+            Self::AdviseData,
+            Vec<Self::Resource>,
+        )>,
+    > + Send;
 
-    #[allow(private_interfaces)]
-    async fn access(
+    fn new_resource(
         &self,
-        queue: Arc<Queue<Self::AccessKey, Self::Task, Self::Data>>,
         offset: u64,
-    ) -> Result<ActiveHandle<Self::Task>>;
+        data: &Self::ResourceData,
+    ) -> impl Future<Output = Result<Self::Resource>> + Send;
+
+    fn advise<'a>(
+        &self,
+        stats: &'a QueueState,
+        data: &mut Self::AdviseData,
+    ) -> Result<(Duration, Option<Action<'a>>)>;
 }
 
-pub(crate) trait BackendTask: Send {
+pub(crate) trait Resource: Send {
     fn offset(&self) -> u64;
     fn can_reuse(&self) -> bool;
     fn finalize(self) -> impl Future<Output = Result<()>> + Send;
+}
+
+pub(crate) enum Action<'a> {
+    Free(&'a Idle),
+    NewResource(&'a Waiting),
+}
+
+pub(crate) struct QueueState {
+    pub idle: Entries<Idle>,
+    pub waiting: Entries<Waiting>,
+    pub active: Entries<Active>,
+    pub preparing: Entries<Preparing>,
+}
+
+impl QueueState {
+    fn new(
+        idle: Vec<Idle>,
+        waiting: Vec<Waiting>,
+        active: Vec<Active>,
+        preparing: Vec<Preparing>,
+    ) -> Self {
+        Self {
+            idle: idle.into_iter().map(|e| (e.offset, e)).collect(),
+            waiting: waiting.into_iter().map(|e| (e.offset, e)).collect(),
+            active: active.into_iter().map(|e| (e.offset, e)).collect(),
+            preparing: preparing.into_iter().map(|e| (e.offset, e)).collect(),
+        }
+    }
+}
+
+pub(crate) struct Entries<T> {
+    len: usize,
+    map: BTreeMap<u64, Vec<T>>,
+}
+
+impl<T> FromIterator<(u64, T)> for Entries<T> {
+    fn from_iter<I: IntoIterator<Item = (u64, T)>>(iter: I) -> Self {
+        let mut map: BTreeMap<u64, Vec<T>> = BTreeMap::new();
+        let mut len = 0;
+        iter.into_iter().for_each(|(offset, v)| {
+            map.entry(offset).or_default().push(v);
+            len += 1;
+        });
+        Self { len, map }
+    }
+}
+
+impl<T> Entries<T> {
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.map.values().flat_map(|t| t.iter())
+    }
+
+    pub fn get_before_offset(&self, offset: u64) -> impl Iterator<Item = &T> {
+        self.map.range(..offset).flat_map(|(_, v)| v.iter())
+    }
+
+    pub fn get_at_or_after_offset(&self, offset: u64) -> impl Iterator<Item = &T> {
+        self.map.range(offset..).flat_map(|(_, v)| v.iter())
+    }
+}
+
+pub(crate) struct Idle {
+    id: usize,
+    pub offset: u64,
+    pub since: SystemTime,
+}
+
+pub(crate) struct Waiting {
+    id: usize,
+    pub offset: u64,
+    pub since: SystemTime,
+}
+
+pub(crate) struct Active {
+    pub offset: u64,
+}
+
+pub(crate) struct Preparing {
+    pub offset: u64,
 }

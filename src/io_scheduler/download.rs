@@ -1,47 +1,39 @@
-use crate::io_scheduler::queue::{ActiveHandle, Activity, Queue, WaitHandle};
-use crate::io_scheduler::{Backend, BackendTask, Scheduler};
+use crate::io_scheduler::{Action, QueueState, Resource, ResourceManager, Scheduler};
 use crate::vfs::file_reader::FileReader;
 use crate::vfs::inode::{File, Inode};
 use crate::vfs::Vfs;
 
 use anyhow::bail;
 use anyhow::Result;
-use itertools::Either;
-use std::cmp::min;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tokio::sync::broadcast;
 use tracing::instrument;
 
 pub(crate) struct Download {
     vfs: Arc<Vfs>,
-    max_downloads: NonZeroUsize,
+    max_active: usize,
     max_wait_for_match: Duration,
-    max_inactivity_for_match: Duration,
-    initial_idle: Duration,
-    max_idle: Duration,
+    min_wait_for_match: Duration,
 }
 
 impl Download {
     pub(crate) fn new(
         vfs: Arc<Vfs>,
-        initial_idle: Duration,
-        max_idle: Duration,
+        max_queue_idle: Duration,
+        max_resource_idle: Duration,
         max_downloads: NonZeroUsize,
         max_wait_for_match: Duration,
-        max_inactivity_for_match: Duration,
+        min_wait_for_match: Duration,
     ) -> Scheduler<Self> {
         let downloader = Download {
             vfs,
-            max_downloads,
+            max_active: max_downloads.get(),
             max_wait_for_match,
-            max_inactivity_for_match,
-            initial_idle,
-            max_idle,
+            min_wait_for_match,
         };
 
-        Scheduler::new(downloader, true)
+        Scheduler::new(downloader, true, max_queue_idle, max_resource_idle, 2)
     }
 
     async fn file(&self, file_id: u64) -> anyhow::Result<File> {
@@ -66,187 +58,99 @@ impl Download {
         );
         Ok(self.vfs.read_file(&file, offset).await?)
     }
-
-    async fn try_resume_download<BT: BackendTask>(
-        &self,
-        offset: u64,
-        queue: &Arc<Queue<u64, BT, ()>>,
-    ) -> Result<Either<ActiveHandle<BT>, (WaitHandle<BT>, broadcast::Receiver<Activity>, u64)>>
-    {
-        let wait_deadline = SystemTime::now() + self.max_wait_for_match;
-        // check if there are any active downloads or reservations that could become potentially interesting
-        let (mut wait_handle, mut activity_rx, file_id, mut last_activity, mut contains_candidate) = {
-            let mut guard = queue.lock();
-            let mut wait_handle = guard.wait(offset);
-            let file_id = *queue.access_key();
-
-            // first, try to resume right now
-            wait_handle = match guard.resume(wait_handle) {
-                Either::Left(active_handle) => {
-                    tracing::trace!("immediate download resumption");
-                    return Ok(Either::Left(active_handle));
-                }
-                Either::Right(wait_handle) => wait_handle,
-            };
-
-            let activity = queue.activity();
-            if offset == 0 {
-                // no need to wait further in this case
-                return Ok(Either::Right((wait_handle, activity, file_id)));
-            }
-            let contains_candidate = guard.contains_candidate(&wait_handle);
-            (
-                wait_handle,
-                activity,
-                file_id,
-                queue.last_activity(),
-                contains_candidate,
-            )
-        };
-
-        loop {
-            // making sure it doesn't exceed total wait time
-            let inactivity_deadline =
-                min(last_activity + self.max_inactivity_for_match, wait_deadline);
-
-            let sleep_deadline = if contains_candidate {
-                // if there is a potential candidate we wait longer
-                wait_deadline
-            } else {
-                inactivity_deadline
-            };
-
-            let sleep_duration = sleep_deadline
-                .duration_since(SystemTime::now())
-                .unwrap_or_else(|_| Duration::from_secs(0));
-
-            tokio::select! {
-                _ = tokio::time::sleep(sleep_duration) => {
-                    tracing::trace!("waiting timeout reached");
-                    return Ok(Either::Right((wait_handle, activity_rx, file_id)));
-                },
-                res = activity_rx.recv() => {
-                    let activity = res?;
-                    last_activity = activity.timestamp();
-                    let mut queue = queue.lock();
-                    if activity.offset() == offset {
-                        if let Activity::Idle(_, _) = activity {
-                            // we want this, try to get it
-                            wait_handle = match queue.resume(wait_handle) {
-                                Either::Left(active_handle) => {
-                                    // success
-                                    tracing::trace!("suitable idle task became available, resuming");
-                                    return Ok(Either::Left(active_handle));
-                                }
-                                Either::Right(wait_handle) => {
-                                    // we missed it
-                                    wait_handle
-                                }
-                            };
-                        }
-                    };
-                    contains_candidate = queue.contains_candidate(&wait_handle);
-                }
-            }
-        }
-    }
 }
 
-impl Backend for Download {
-    type Task = FileReader;
+impl ResourceManager for Download {
+    type Resource = FileReader;
     type PreparationKey = u64;
     type AccessKey = u64;
-    type Data = ();
+    type ResourceData = u64;
+    type AdviseData = ();
 
     #[instrument[skip(self)]]
     async fn prepare(
         &self,
         preparation_key: &Self::PreparationKey,
-    ) -> Result<Queue<Self::AccessKey, Self::Task, Self::Data>> {
+    ) -> Result<(
+        Self::AccessKey,
+        Self::ResourceData,
+        Self::AdviseData,
+        Vec<Self::Resource>,
+    )> {
         let file = self.file(*preparation_key).await?;
         tracing::debug!(
             file_id = file.id(),
             file_name = file.name(),
             "download prepared"
         );
-        Ok(Queue::new(
-            file.id(),
-            (),
-            self.max_downloads,
-            self.max_idle,
-            SystemTime::now() + self.initial_idle,
-            vec![],
-        ))
+        Ok((file.id(), file.id(), (), vec![]))
     }
 
-    #[allow(private_interfaces)]
-    async fn access(
+    async fn new_resource(&self, offset: u64, data: &Self::ResourceData) -> Result<Self::Resource> {
+        let file_id = *data;
+        self.download(file_id, offset).await
+    }
+
+    fn advise<'a>(
         &self,
-        queue: Arc<Queue<Self::AccessKey, Self::Task, Self::Data>>,
-        offset: u64,
-    ) -> Result<ActiveHandle<Self::Task>> {
-        tracing::trace!("begin acquiring handle");
-
-        // Phase 1: try to resume a download
-        let (wait_handle, mut activity_rx, file_id) =
-            match self.try_resume_download(offset, &queue).await? {
-                Either::Left(active_handle) => {
-                    return Ok(active_handle);
-                }
-                Either::Right(wait_handle) => wait_handle,
-            };
-
-        // Phase 2: Start a new download
-        let mut handle = Either::Right(wait_handle);
-        loop {
-            match handle {
-                Either::Left(reserve_handle) => {
-                    // start a new download
-                    let file_reader = self.download(file_id, offset).await?;
-                    let mut queue = queue.lock();
-                    tracing::trace!("redeeming reservation");
-                    return Ok(queue.redeem(reserve_handle, file_reader));
-                }
-                Either::Right(wait_handle) => {
-                    match {
-                        let mut queue = queue.lock();
-                        // first, try to reserve a slot directly
-                        let wait_handle = match queue.reserve(wait_handle) {
-                            Either::Left(reserve_handle) => {
-                                // good, we got a reserve slot
-                                // skip to next iteration to start download
-                                tracing::trace!("new slot reserved");
-                                handle = Either::Left(reserve_handle);
-                                continue;
-                            }
-                            Either::Right(wait_handle) => wait_handle,
-                        };
-                        // unfortunately, no free slot could be reserved
-                        // next, try to free an idle slot
-                        let res = queue.try_free(wait_handle);
-                        // avoid unnecessary work by marking the current state as seen
-                        activity_rx = activity_rx.resubscribe();
-                        res
-                    } {
-                        Either::Left(freed_handle) => {
-                            // an idle slot has been freed for this reserved slot
-                            let reserved_handle = freed_handle.finalize().await?;
-                            tracing::trace!("freed download and acquired reservation");
-                            handle = Either::Left(reserved_handle);
-                        }
-                        Either::Right(wait_handle) => {
-                            // everything is busy and full, try again once something changes
-                            handle = Either::Right(wait_handle);
-                            let _ = activity_rx.recv().await?;
-                        }
-                    }
-                }
+        stats: &'a QueueState,
+        _data: &mut Self::AdviseData,
+    ) -> Result<(Duration, Option<Action<'a>>)> {
+        assert!(!stats.waiting.is_empty());
+        // first, check if we need to free idle resources
+        if stats.active.len() + stats.preparing.len() + stats.idle.len() >= self.max_active {
+            // find the resource that has been idle the longest
+            if let Some(idle) = stats.idle.iter().min_by_key(|i| i.since) {
+                return Ok((Duration::from_millis(0), Some(Action::Free(idle))));
+            } else {
+                // nothing we can do now
+                return Ok((Duration::from_millis(250), None));
             }
         }
+
+        // get the wait resource with the lowest offset
+        let waiting = stats.waiting.iter().min_by_key(|w| w.offset).unwrap();
+        if waiting.offset == 0 {
+            // no need to wait here
+            return Ok((
+                Duration::from_millis(250),
+                Some(Action::NewResource(waiting)),
+            ));
+        }
+        let wait_duration = SystemTime::now()
+            .duration_since(waiting.since)
+            .unwrap_or_default();
+        if wait_duration < self.min_wait_for_match {
+            let next_try_in = (self.min_wait_for_match - wait_duration) + Duration::from_millis(1);
+            // check later
+            return Ok((next_try_in, None));
+        }
+
+        if stats.active.get_before_offset(waiting.offset).count() == 0 {
+            // start new download now
+            return Ok((
+                Duration::from_millis(250),
+                Some(Action::NewResource(waiting)),
+            ));
+        }
+
+        let wait_duration = SystemTime::now()
+            .duration_since(waiting.since)
+            .unwrap_or_default();
+        if wait_duration < self.max_wait_for_match {
+            let next_try_in = (self.max_wait_for_match - wait_duration) + Duration::from_millis(1);
+            // check later
+            return Ok((next_try_in, None));
+        }
+
+        Ok((
+            Duration::from_millis(250),
+            Some(Action::NewResource(waiting)),
+        ))
     }
 }
 
-impl BackendTask for FileReader {
+impl Resource for FileReader {
     fn offset(&self) -> u64 {
         self.offset()
     }
@@ -255,7 +159,7 @@ impl BackendTask for FileReader {
         !self.eof() && self.error_count() == 0
     }
 
-    async fn finalize(self) -> anyhow::Result<()> {
+    async fn finalize(self) -> Result<()> {
         Ok(())
     }
 }

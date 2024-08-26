@@ -31,23 +31,21 @@ impl SiaNfsFs {
     pub(super) fn new(
         vfs: Arc<Vfs>,
         max_downloads_per_file: NonZeroUsize,
-        download_initial_idle: Duration,
         download_max_idle: Duration,
         download_max_wait_for_match: Duration,
-        download_max_inactivity_for_match: Duration,
-        upload_initial_idle: Duration,
+        download_min_wait_for_match: Duration,
         upload_max_idle: Duration,
         read_cache: Option<(u64, Duration, Duration)>,
     ) -> Self {
         let downloader = Download::new(
             vfs.clone(),
-            download_initial_idle,
+            download_max_idle,
             download_max_idle,
             max_downloads_per_file,
             download_max_wait_for_match,
-            download_max_inactivity_for_match,
+            download_min_wait_for_match,
         );
-        let uploader = Upload::new(vfs.clone(), upload_initial_idle, upload_max_idle);
+        let uploader = Upload::new(vfs.clone(), upload_max_idle);
         Self {
             downloader,
             uploader,

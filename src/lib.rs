@@ -45,11 +45,9 @@ impl SiaNfs {
                 SiaNfsFs::new(
                     vfs,
                     NonZeroUsize::new(5).unwrap(),
-                    Duration::from_secs(2),
-                    Duration::from_secs(3),
-                    Duration::from_secs(1),
+                    Duration::from_millis(500),
+                    Duration::from_millis(800),
                     Duration::from_millis(200),
-                    Duration::from_secs(5),
                     Duration::from_secs(5),
                     Some((250, Duration::from_secs(120), Duration::from_secs(60))),
                 ),

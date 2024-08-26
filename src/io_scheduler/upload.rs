@@ -1,48 +1,37 @@
-use crate::io_scheduler::queue::{ActiveHandle, Activity, Queue};
-use crate::io_scheduler::{Backend, BackendTask, Scheduler};
+use crate::io_scheduler::{Action, ResourceManager, Resource, QueueState, Scheduler};
 use crate::vfs::file_writer::FileWriter;
 use crate::vfs::inode::Inode;
 use crate::vfs::Vfs;
 use anyhow::bail;
-use itertools::Either;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 pub(crate) struct Upload {
     vfs: Arc<Vfs>,
-    initial_idle: Duration,
-    max_idle: Duration,
 }
 
 impl Upload {
-    pub(crate) fn new(
-        vfs: Arc<Vfs>,
-        initial_idle: Duration,
-        max_idle: Duration,
-    ) -> Scheduler<Self> {
-        Scheduler::new(
-            Upload {
-                vfs,
-                initial_idle,
-                max_idle,
-            },
-            false,
-        )
+    pub(crate) fn new(vfs: Arc<Vfs>, max_idle: Duration) -> Scheduler<Self> {
+        Scheduler::new(Upload { vfs }, false, max_idle, max_idle, 0)
     }
 }
 
-impl Backend for Upload {
-    type Task = FileWriter;
+impl ResourceManager for Upload {
+    type Resource = FileWriter;
     type PreparationKey = (u64, String);
     type AccessKey = u64;
-    type Data = ();
+    type ResourceData = ();
+    type AdviseData = ();
 
-    #[allow(private_interfaces)]
     async fn prepare(
         &self,
         preparation_key: &Self::PreparationKey,
-    ) -> anyhow::Result<Queue<Self::AccessKey, Self::Task, Self::Data>> {
+    ) -> anyhow::Result<(
+        Self::AccessKey,
+        Self::ResourceData,
+        Self::AdviseData,
+        Vec<Self::Resource>,
+    )> {
         let (parent_id, name) = preparation_key;
         let parent = match self.vfs.inode_by_id(*parent_id).await? {
             Some(Inode::Directory(dir)) => dir,
@@ -63,58 +52,24 @@ impl Backend for Upload {
             "upload prepared"
         );
 
-        let queue = Queue::new(
-            file.id(),
-            (),
-            NonZeroUsize::new(1).unwrap(),
-            self.max_idle,
-            SystemTime::now() + self.initial_idle,
-            vec![fw],
-        );
-
-        Ok(queue)
+        Ok((file.id(), (), (), vec![fw]))
     }
 
-    #[allow(private_interfaces)]
-    async fn access(
+    async fn new_resource(&self, _offset: u64, _data: &Self::ResourceData) -> anyhow::Result<Self::Resource> {
+        bail!("upload queues cannot start new resources")
+    }
+
+    fn advise<'a>(
         &self,
-        queue: Arc<Queue<Self::AccessKey, Self::Task, Self::Data>>,
-        offset: u64,
-    ) -> anyhow::Result<ActiveHandle<Self::Task>> {
-        tracing::trace!("begin acquiring handle");
-        let (mut wait_handle, mut activity) = {
-            let mut quard = queue.lock();
-            (quard.wait(offset), queue.activity())
-        };
-        loop {
-            {
-                let mut queue = queue.lock();
-                match queue.resume(wait_handle) {
-                    Either::Left(active_handle) => {
-                        tracing::trace!("upload resumption");
-                        return Ok(active_handle);
-                    }
-                    Either::Right(h) => {
-                        wait_handle = h;
-                        activity = activity.resubscribe();
-                    }
-                }
-            }
-            tracing::trace!("waiting for upload progress");
-            loop {
-                let activity = activity.recv().await?;
-                if activity.offset() == offset {
-                    if let Activity::Idle(..) = activity {
-                        tracing::trace!("suitable idle task became available, resuming");
-                        break;
-                    }
-                }
-            }
-        }
+        _stats: &'a QueueState,
+        _data: &mut Self::AdviseData,
+    ) -> anyhow::Result<(Duration, Option<Action<'a>>)> {
+        let next_consultation = Duration::from_secs(10);
+        Ok((next_consultation, None))
     }
 }
 
-impl BackendTask for FileWriter {
+impl Resource for FileWriter {
     fn offset(&self) -> u64 {
         self.bytes_written()
     }
