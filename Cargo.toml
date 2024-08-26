@@ -16,7 +16,7 @@ itertools = "0.13"
 moka = { version = "0.12", features = ["future"] }
 nfsserve = "0.10"
 parking_lot = "0.12"
-renterd_client = { git = "https://github.com/rrauch/renterd_client.git", rev = "60db9509529d611767a53e3d816eed6358c6af9b" }
+renterd_client = { git = "https://github.com/rrauch/renterd_client.git", rev = "b6c3d08fc4e78b1304365a9a898f23b60c344cc5" }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "migrate", "chrono"] }
 tokio = { version = "1.39", features = ["full"] }
 tokio-util = "0.7"
@@ -27,3 +27,6 @@ url = "2.5"
 [build-dependencies]
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "migrate", "chrono"] }
 tokio = { version = "1.39", features = ["full"] }
+
+[patch.crates-io]
+nfsserve = { git = "https://github.com/rrauch/nfsserve.git", rev = "57327866361b35c63829ee31cb0fdb4b9f07c08b" }

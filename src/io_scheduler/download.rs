@@ -6,10 +6,8 @@ use crate::vfs::Vfs;
 
 use anyhow::bail;
 use anyhow::Result;
-use futures_util::AsyncSeekExt;
 use itertools::Either;
 use std::cmp::min;
-use std::io::SeekFrom;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -66,9 +64,7 @@ impl Download {
             offset,
             "initiating new download"
         );
-        let mut file_reader = self.vfs.read_file(&file).await?;
-        file_reader.seek(SeekFrom::Start(offset)).await?;
-        Ok(file_reader)
+        Ok(self.vfs.read_file(&file, offset).await?)
     }
 
     async fn try_resume_download<BT: BackendTask>(

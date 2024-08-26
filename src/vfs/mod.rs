@@ -409,7 +409,11 @@ impl Vfs {
         self.inode_manager.sync_dir(dir_id, stream).await
     }
 
-    pub async fn read_file(&self, file: &File) -> Result<FileReader> {
+    pub async fn read_file(
+        &self,
+        file: &File,
+        offset: impl Into<Option<u64>>,
+    ) -> Result<FileReader> {
         let (bucket, path) = self
             .inode_to_bucket_path(Inode::File(file.clone()))
             .await?
@@ -442,12 +446,14 @@ impl Vfs {
             .await?
             .ok_or(anyhow!("renterd couldn't find the file"))?;
 
+        let offset = offset.into().unwrap_or(0);
         let size = object.length.ok_or(anyhow!("file size is unknown"))?;
-        let stream = object.open_seekable_stream().await?;
+        let stream = object.open_seekable_stream(offset).await?;
 
         Ok(FileReader::new(
             file.clone(),
             size,
+            offset,
             stream,
             read_lock,
             download_permit,

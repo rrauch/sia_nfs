@@ -21,6 +21,7 @@ impl FileReader {
     pub(super) fn new(
         file: File,
         size: u64,
+        offset: u64,
         stream: impl AsyncRead + AsyncSeek + Send + Unpin + 'static,
         read_lock: ReadLock,
         download_permit: OwnedSemaphorePermit,
@@ -29,7 +30,7 @@ impl FileReader {
             file,
             _read_lock: read_lock,
             _download_permit: download_permit,
-            offset: 0,
+            offset,
             size,
             stream: Box::new(stream),
             error_count: 0,
@@ -49,7 +50,7 @@ impl FileReader {
     }
 
     pub fn eof(&self) -> bool {
-        self.offset == self.size
+        self.offset >= self.size
     }
 
     pub fn error_count(&self) -> usize {

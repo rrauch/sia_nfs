@@ -1181,8 +1181,7 @@ dependencies = [
 [[package]]
 name = "nfsserve"
 version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d73615e054238e6bf5e554407b5b23e82fc63616db459057c51b794799eda6fb"
+source = "git+https://github.com/rrauch/nfsserve.git?rev=57327866361b35c63829ee31cb0fdb4b9f07c08b#57327866361b35c63829ee31cb0fdb4b9f07c08b"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1654,7 +1653,7 @@ checksum = "7a66a03ae7c801facd77a29370b4faec201768915ac14a721ba36f20bc9c209b"
 [[package]]
 name = "renterd_client"
 version = "0.1.0"
-source = "git+https://github.com/rrauch/renterd_client.git?rev=60db9509529d611767a53e3d816eed6358c6af9b#60db9509529d611767a53e3d816eed6358c6af9b"
+source = "git+https://github.com/rrauch/renterd_client.git?rev=b6c3d08fc4e78b1304365a9a898f23b60c344cc5#b6c3d08fc4e78b1304365a9a898f23b60c344cc5"
 dependencies = [
  "bandwidth",
  "bigdecimal",
@@ -1727,7 +1726,7 @@ dependencies = [
 [[package]]
 name = "reqwest-file"
 version = "0.2.1"
-source = "git+https://github.com/rrauch/renterd_client.git?rev=60db9509529d611767a53e3d816eed6358c6af9b#60db9509529d611767a53e3d816eed6358c6af9b"
+source = "git+https://github.com/rrauch/renterd_client.git?rev=b6c3d08fc4e78b1304365a9a898f23b60c344cc5#b6c3d08fc4e78b1304365a9a898f23b60c344cc5"
 dependencies = [
  "bytes",
  "futures-util",
