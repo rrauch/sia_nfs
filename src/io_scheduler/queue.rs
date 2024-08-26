@@ -1,5 +1,4 @@
 use crate::io_scheduler::BackendTask;
-use crate::vfs::inode::File;
 use itertools::{Either, Itertools};
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::HashMap;
@@ -55,17 +54,16 @@ impl Activity {
 }
 
 pub(super) struct Queue<BT: BackendTask> {
-    file_rx: watch::Receiver<File>,
     last_activity_rx: watch::Receiver<SystemTime>,
     active: Arc<AtomicUsize>,
     queue_len: Arc<AtomicUsize>,
     expiration_rx: watch::Receiver<SystemTime>,
     activity_tx: broadcast::Sender<Activity>,
     shared: Arc<Mutex<Shared<BT>>>,
+    file_id: u64,
 }
 
 struct Shared<BT: BackendTask> {
-    file_tx: watch::Sender<File>,
     last_activity_tx: watch::Sender<SystemTime>,
     active: Arc<AtomicUsize>,
     max_active: usize, // this includes reserved
@@ -79,22 +77,20 @@ struct Shared<BT: BackendTask> {
 
 impl<BT: BackendTask> Queue<BT> {
     pub(super) fn new(
+        file_id: u64,
         max_active: NonZeroUsize,
         max_idle: Duration,
         initial_expiration: SystemTime,
         initial_tasks: Vec<BT>,
-        file: File,
     ) -> Self {
         let (activity_tx, _) = broadcast::channel(30);
         let (expiration_tx, expiration_rx) = watch::channel(initial_expiration);
-        let (file_tx, file_rx) = watch::channel(file);
         let now = SystemTime::now();
         let (last_activity_tx, last_activity_rx) = watch::channel(now);
         let mut id_counter = 0;
         let active = Arc::new(AtomicUsize::new(0));
         let queue_len = Arc::new(AtomicUsize::new(0));
         let shared = Arc::new(Mutex::new(Shared {
-            file_tx,
             last_activity_tx,
             active: active.clone(),
             max_active: max_active.get(),
@@ -125,14 +121,18 @@ impl<BT: BackendTask> Queue<BT> {
             expiration_tx,
         }));
         Self {
-            file_rx,
             last_activity_rx,
             active,
             queue_len,
             expiration_rx,
             activity_tx,
             shared,
+            file_id,
         }
+    }
+
+    pub fn file_id(&self) -> u64 {
+        self.file_id
     }
 
     pub(crate) fn is_active(&self) -> bool {
@@ -153,10 +153,6 @@ impl<BT: BackendTask> Queue<BT> {
 
     pub fn expiration(&self) -> watch::Receiver<SystemTime> {
         self.expiration_rx.clone()
-    }
-
-    pub fn file(&self) -> watch::Receiver<File> {
-        self.file_rx.clone()
     }
 
     pub fn last_activity(&self) -> SystemTime {
@@ -583,7 +579,6 @@ impl<BT: BackendTask> Drop for ActiveHandle<BT> {
             let _ = shared.last_activity_tx.send(now);
             let activity_tx = shared.activity_tx.clone();
             if task.can_reuse() {
-                let _ = shared.file_tx.send(task.to_file());
                 if let Some(qe) = shared.queue.get_mut(&self.id) {
                     tracing::trace!(offset = task.offset(), "returning reusable task to queue");
                     qe.since = now;

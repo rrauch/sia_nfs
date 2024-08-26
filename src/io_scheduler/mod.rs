@@ -1,6 +1,5 @@
 use crate::io_scheduler::queue::{ActiveHandle, Queue};
 use crate::io_scheduler::reaper::Reaper;
-use crate::vfs::inode::File;
 use anyhow::{anyhow, bail, Result};
 use bimap::BiHashMap;
 use parking_lot::RwLock;
@@ -44,7 +43,7 @@ impl<B: Backend + 'static + Sync> Scheduler<B> {
         }
     }
 
-    pub async fn prepare(&self, key: &B::Key) -> Result<File> {
+    pub async fn prepare(&self, key: &B::Key) -> Result<u64> {
         loop {
             let (notify, fut) = {
                 let queues = &mut self.state.write().queues;
@@ -57,7 +56,7 @@ impl<B: Backend + 'static + Sync> Scheduler<B> {
                     Some(Status::Preparing(notify)) => (notify.clone(), None),
                     Some(Status::Ready(queue)) => {
                         if self.allow_existing_queue {
-                            return Ok(queue.file().borrow().clone());
+                            return Ok(queue.file_id());
                         } else {
                             bail!("queue for key {:?} already exists", key);
                         }
@@ -71,16 +70,15 @@ impl<B: Backend + 'static + Sync> Scheduler<B> {
                 notify.notify_waiters();
                 return match res {
                     Ok(queue) => {
-                        let file = queue.file().borrow().clone();
+                        let file_id = queue.file_id();
                         state
                             .queues
                             .insert(key.clone(), Status::Ready(Arc::new(queue)));
                         let file_id_keys = &mut state.file_id_keys;
-                        let file_id = file.id();
                         file_id_keys.insert(file_id, key.clone());
                         // let the reaper know there's a new queue
                         self.reaper.notify();
-                        Ok(file)
+                        Ok(file_id)
                     }
                     Err(err) => {
                         state.queues.remove(key);
@@ -138,5 +136,4 @@ pub(crate) trait BackendTask: Send {
     fn offset(&self) -> u64;
     fn can_reuse(&self) -> bool;
     fn finalize(self) -> impl Future<Output = Result<()>> + Send;
-    fn to_file(&self) -> File;
 }

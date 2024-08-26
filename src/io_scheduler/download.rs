@@ -78,7 +78,7 @@ impl Download {
         let (mut wait_handle, mut activity_rx, file_id, mut last_activity, mut contains_candidate) = {
             let mut guard = queue.lock();
             let mut wait_handle = guard.wait(offset);
-            let file_id = queue.file().borrow().id();
+            let file_id = queue.file_id();
 
             // first, try to resume right now
             wait_handle = match guard.resume(wait_handle) {
@@ -165,11 +165,11 @@ impl Backend for Download {
             "download prepared"
         );
         Ok(Queue::new(
+            file.id(),
             self.max_downloads,
             self.max_idle,
             SystemTime::now() + self.initial_idle,
             vec![],
-            file,
         ))
     }
 
@@ -251,9 +251,5 @@ impl BackendTask for FileReader {
 
     async fn finalize(self) -> anyhow::Result<()> {
         Ok(())
-    }
-
-    fn to_file(&self) -> File {
-        self.file().clone()
     }
 }

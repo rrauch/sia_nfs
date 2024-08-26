@@ -1,7 +1,7 @@
 use crate::io_scheduler::queue::{ActiveHandle, Activity, Queue};
 use crate::io_scheduler::{Backend, BackendTask, Scheduler};
 use crate::vfs::file_writer::FileWriter;
-use crate::vfs::inode::{File, Inode};
+use crate::vfs::inode::Inode;
 use crate::vfs::Vfs;
 use anyhow::bail;
 use itertools::Either;
@@ -59,11 +59,11 @@ impl Backend for Upload {
         );
 
         let queue = Queue::new(
+            file.id(),
             NonZeroUsize::new(1).unwrap(),
             self.max_idle,
             SystemTime::now() + self.initial_idle,
             vec![fw],
-            file,
         );
 
         Ok(queue)
@@ -120,9 +120,5 @@ impl BackendTask for FileWriter {
     async fn finalize(self) -> anyhow::Result<()> {
         let _ = self.finalize().await?;
         Ok(())
-    }
-
-    fn to_file(&self) -> File {
-        self.to_file()
     }
 }

@@ -86,14 +86,14 @@ impl SiaNfsFs {
             return Ok((vec![], true));
         }
         let id = file.id();
-        let file = self.downloader.prepare(&id).await.map_err(|e| {
+        let file_id = self.downloader.prepare(&id).await.map_err(|e| {
             tracing::error!(error = %e, "failed to prepare download for file {}", id);
             NFS3ERR_SERVERFAULT
         })?;
 
         let mut dl = self
             .downloader
-            .acquire(file.id(), offset)
+            .acquire(file_id, offset)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to acquire download handle for file {}", file.id());
@@ -205,7 +205,7 @@ impl NFSFileSystem for SiaNfsFs {
             Inode::Directory(dir) => dir,
         };
 
-        let file = self
+        let file_id = self
             .uploader
             .prepare(&(parent.id(), name.to_string()))
             .await
@@ -214,7 +214,7 @@ impl NFSFileSystem for SiaNfsFs {
                 NFS3ERR_IO
             })?;
 
-        Ok(file.id())
+        Ok(file_id)
     }
 
     async fn mkdir(
