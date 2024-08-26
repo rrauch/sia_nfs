@@ -1,5 +1,6 @@
 use crate::vfs::inode::File;
 use crate::vfs::locking::ReadLock;
+use crate::ReadStream;
 use futures::{AsyncRead, AsyncSeek};
 use std::io::SeekFrom;
 use std::pin::Pin;
@@ -57,9 +58,6 @@ impl FileReader {
         self.error_count
     }
 }
-
-trait ReadStream: AsyncRead + AsyncSeek {}
-impl<T: AsyncRead + AsyncSeek> ReadStream for T {}
 
 impl AsyncRead for FileReader {
     fn poll_read(
