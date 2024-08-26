@@ -93,7 +93,7 @@ impl SiaNfsFs {
 
         let mut dl = self
             .downloader
-            .acquire(file_id, offset)
+            .access(&file_id, offset)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to acquire download handle for file {}", file.id());
@@ -161,7 +161,7 @@ impl NFSFileSystem for SiaNfsFs {
 
         let mut upload = self
             .uploader
-            .acquire(file.id(), offset)
+            .access(&file.id(), offset)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to acquire upload handle for {}", file.id());

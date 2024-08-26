@@ -34,11 +34,15 @@ impl Upload {
 
 impl Backend for Upload {
     type Task = FileWriter;
-    type Key = (u64, String);
+    type PreparationKey = (u64, String);
+    type AccessKey = u64;
 
     #[allow(private_interfaces)]
-    async fn begin(&self, key: &Self::Key) -> anyhow::Result<Queue<Self::Task>> {
-        let (parent_id, name) = key;
+    async fn prepare(
+        &self,
+        preparation_key: &Self::PreparationKey,
+    ) -> anyhow::Result<Queue<Self::AccessKey, Self::Task>> {
+        let (parent_id, name) = preparation_key;
         let parent = match self.vfs.inode_by_id(*parent_id).await? {
             Some(Inode::Directory(dir)) => dir,
             Some(Inode::File(_)) => {
@@ -70,9 +74,9 @@ impl Backend for Upload {
     }
 
     #[allow(private_interfaces)]
-    async fn acquire(
+    async fn access(
         &self,
-        queue: Arc<Queue<Self::Task>>,
+        queue: Arc<Queue<Self::AccessKey, Self::Task>>,
         offset: u64,
     ) -> anyhow::Result<ActiveHandle<Self::Task>> {
         tracing::trace!("begin acquiring handle");

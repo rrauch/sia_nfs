@@ -2,6 +2,8 @@ use crate::io_scheduler::BackendTask;
 use itertools::{Either, Itertools};
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::HashMap;
+use std::fmt::Debug;
+use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -53,14 +55,14 @@ impl Activity {
     }
 }
 
-pub(super) struct Queue<BT: BackendTask> {
+pub(super) struct Queue<K: Hash + Eq + Clone + Send + 'static + Sync + Debug, BT: BackendTask> {
     last_activity_rx: watch::Receiver<SystemTime>,
     active: Arc<AtomicUsize>,
     queue_len: Arc<AtomicUsize>,
     expiration_rx: watch::Receiver<SystemTime>,
     activity_tx: broadcast::Sender<Activity>,
     shared: Arc<Mutex<Shared<BT>>>,
-    file_id: u64,
+    access_key: K,
 }
 
 struct Shared<BT: BackendTask> {
@@ -75,9 +77,9 @@ struct Shared<BT: BackendTask> {
     expiration_tx: watch::Sender<SystemTime>,
 }
 
-impl<BT: BackendTask> Queue<BT> {
+impl<K: Hash + Eq + Clone + Send + 'static + Sync + Debug, BT: BackendTask> Queue<K, BT> {
     pub(super) fn new(
-        file_id: u64,
+        access_key: K,
         max_active: NonZeroUsize,
         max_idle: Duration,
         initial_expiration: SystemTime,
@@ -127,12 +129,12 @@ impl<BT: BackendTask> Queue<BT> {
             expiration_rx,
             activity_tx,
             shared,
-            file_id,
+            access_key,
         }
     }
 
-    pub fn file_id(&self) -> u64 {
-        self.file_id
+    pub fn access_key(&self) -> K {
+        self.access_key.clone()
     }
 
     pub(crate) fn is_active(&self) -> bool {

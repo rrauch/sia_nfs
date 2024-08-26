@@ -84,34 +84,38 @@ impl<B: Backend> Runner<B> {
             let mut finalizations = FuturesUnordered::new();
             {
                 let mut shared_state = self.shared_state.write();
-                self.expiration_tracker.expired.iter().for_each(|key| {
-                    let mut reap = false;
-                    if let Some(Status::Ready(queue)) = shared_state.queues.get(key) {
+                self.expiration_tracker
+                    .expired
+                    .iter()
+                    .for_each(|preparation_key| {
+                        let mut reap = false;
+                        if let Some(Status::Ready(queue)) = shared_state.queues.get(preparation_key)
                         {
-                            let mut guard = queue.lock();
-                            guard
-                                .remove_expired_idle()
-                                .into_iter()
-                                .for_each(|t| finalizations.push(t.finalize()));
-                            reap = queue.is_empty();
-                        };
+                            {
+                                let mut guard = queue.lock();
+                                guard
+                                    .remove_expired_idle()
+                                    .into_iter()
+                                    .for_each(|t| finalizations.push(t.finalize()));
+                                reap = queue.is_empty();
+                            };
 
-                        if reap {
-                            if Arc::strong_count(queue) != 1 {
-                                tracing::debug!(
-                                    "queue {:?} empty but still held, postponing removal",
-                                    key
-                                );
-                                reap = false;
+                            if reap {
+                                if Arc::strong_count(queue) != 1 {
+                                    tracing::debug!(
+                                        "queue {:?} empty but still held, postponing removal",
+                                        preparation_key
+                                    );
+                                    reap = false;
+                                }
                             }
                         }
-                    }
-                    if reap {
-                        shared_state.queues.remove(key);
-                        shared_state.file_id_keys.remove_by_right(key);
-                        tracing::debug!("removed expired queue {:?}", key);
-                    }
-                })
+                        if reap {
+                            shared_state.queues.remove(preparation_key);
+                            shared_state.key_map.remove_by_left(preparation_key);
+                            tracing::debug!("removed expired queue {:?}", preparation_key);
+                        }
+                    })
             }
 
             // awaiting all finalizations
@@ -138,15 +142,15 @@ impl<B: Backend> Runner<B> {
 }
 
 struct ExpirationTracker<B: Backend> {
-    map: HashMap<B::Key, watch::Receiver<SystemTime>>,
-    expired: HashSet<B::Key>,
+    map: HashMap<B::PreparationKey, watch::Receiver<SystemTime>>,
+    expired: HashSet<B::PreparationKey>,
     next_expiration: Option<SystemTime>,
 }
 
 impl<B: Backend> ExpirationTracker<B> {
     fn sync<'a, I>(&mut self, active: I)
     where
-        I: Iterator<Item = (&'a B::Key, &'a Arc<Queue<B::Task>>)>,
+        I: Iterator<Item = (&'a B::PreparationKey, &'a Arc<Queue<B::AccessKey, B::Task>>)>,
         B: 'a,
     {
         let mut seen_keys = HashSet::new();
