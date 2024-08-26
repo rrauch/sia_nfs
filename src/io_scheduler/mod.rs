@@ -59,7 +59,7 @@ impl<B: Backend + 'static + Sync> Scheduler<B> {
                     Some(Status::Preparing(notify)) => (notify.clone(), None),
                     Some(Status::Ready(queue)) => {
                         if self.allow_existing_queue {
-                            return Ok(queue.access_key());
+                            return Ok(queue.access_key().clone());
                         } else {
                             bail!(
                                 "queue for preparation_key {:?} already exists",
@@ -76,7 +76,7 @@ impl<B: Backend + 'static + Sync> Scheduler<B> {
                 notify.notify_waiters();
                 return match res {
                     Ok(queue) => {
-                        let access_key = queue.access_key();
+                        let access_key = queue.access_key().clone();
                         state
                             .queues
                             .insert(preparation_key.clone(), Status::Ready(Arc::new(queue)));
@@ -127,23 +127,24 @@ impl<B: Backend + 'static + Sync> Scheduler<B> {
 
 enum Status<B: Backend> {
     Preparing(Arc<Notify>),
-    Ready(Arc<Queue<B::AccessKey, B::Task>>),
+    Ready(Arc<Queue<B::AccessKey, B::Task, B::Data>>),
 }
 
 pub(crate) trait Backend: Sized {
     type Task: BackendTask;
     type PreparationKey: Hash + Eq + Clone + Send + 'static + Sync + Debug;
     type AccessKey: Hash + Eq + Clone + Send + 'static + Sync + Debug;
+    type Data: Send + Sync + 'static;
 
     fn prepare(
         &self,
         preparation_key: &Self::PreparationKey,
-    ) -> impl Future<Output = Result<Queue<Self::AccessKey, Self::Task>>> + Send;
+    ) -> impl Future<Output = Result<Queue<Self::AccessKey, Self::Task, Self::Data>>> + Send;
 
     #[allow(private_interfaces)]
     async fn access(
         &self,
-        queue: Arc<Queue<Self::AccessKey, Self::Task>>,
+        queue: Arc<Queue<Self::AccessKey, Self::Task, Self::Data>>,
         offset: u64,
     ) -> Result<ActiveHandle<Self::Task>>;
 }

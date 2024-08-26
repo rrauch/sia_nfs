@@ -70,7 +70,7 @@ impl Download {
     async fn try_resume_download<BT: BackendTask>(
         &self,
         offset: u64,
-        queue: &Arc<Queue<u64, BT>>,
+        queue: &Arc<Queue<u64, BT, ()>>,
     ) -> Result<Either<ActiveHandle<BT>, (WaitHandle<BT>, broadcast::Receiver<Activity>, u64)>>
     {
         let wait_deadline = SystemTime::now() + self.max_wait_for_match;
@@ -78,7 +78,7 @@ impl Download {
         let (mut wait_handle, mut activity_rx, file_id, mut last_activity, mut contains_candidate) = {
             let mut guard = queue.lock();
             let mut wait_handle = guard.wait(offset);
-            let file_id = queue.access_key();
+            let file_id = *queue.access_key();
 
             // first, try to resume right now
             wait_handle = match guard.resume(wait_handle) {
@@ -156,12 +156,13 @@ impl Backend for Download {
     type Task = FileReader;
     type PreparationKey = u64;
     type AccessKey = u64;
+    type Data = ();
 
     #[instrument[skip(self)]]
     async fn prepare(
         &self,
         preparation_key: &Self::PreparationKey,
-    ) -> Result<Queue<Self::AccessKey, Self::Task>> {
+    ) -> Result<Queue<Self::AccessKey, Self::Task, Self::Data>> {
         let file = self.file(*preparation_key).await?;
         tracing::debug!(
             file_id = file.id(),
@@ -170,6 +171,7 @@ impl Backend for Download {
         );
         Ok(Queue::new(
             file.id(),
+            (),
             self.max_downloads,
             self.max_idle,
             SystemTime::now() + self.initial_idle,
@@ -180,7 +182,7 @@ impl Backend for Download {
     #[allow(private_interfaces)]
     async fn access(
         &self,
-        queue: Arc<Queue<Self::AccessKey, Self::Task>>,
+        queue: Arc<Queue<Self::AccessKey, Self::Task, Self::Data>>,
         offset: u64,
     ) -> Result<ActiveHandle<Self::Task>> {
         tracing::trace!("begin acquiring handle");

@@ -150,7 +150,12 @@ struct ExpirationTracker<B: Backend> {
 impl<B: Backend> ExpirationTracker<B> {
     fn sync<'a, I>(&mut self, active: I)
     where
-        I: Iterator<Item = (&'a B::PreparationKey, &'a Arc<Queue<B::AccessKey, B::Task>>)>,
+        I: Iterator<
+            Item = (
+                &'a B::PreparationKey,
+                &'a Arc<Queue<B::AccessKey, B::Task, B::Data>>,
+            ),
+        >,
         B: 'a,
     {
         let mut seen_keys = HashSet::new();

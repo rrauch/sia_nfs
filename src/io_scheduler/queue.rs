@@ -2,8 +2,6 @@ use crate::io_scheduler::BackendTask;
 use itertools::{Either, Itertools};
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::HashMap;
-use std::fmt::Debug;
-use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -55,7 +53,7 @@ impl Activity {
     }
 }
 
-pub(super) struct Queue<K: Hash + Eq + Clone + Send + 'static + Sync + Debug, BT: BackendTask> {
+pub(super) struct Queue<K, BT: BackendTask, D> {
     last_activity_rx: watch::Receiver<SystemTime>,
     active: Arc<AtomicUsize>,
     queue_len: Arc<AtomicUsize>,
@@ -63,6 +61,7 @@ pub(super) struct Queue<K: Hash + Eq + Clone + Send + 'static + Sync + Debug, BT
     activity_tx: broadcast::Sender<Activity>,
     shared: Arc<Mutex<Shared<BT>>>,
     access_key: K,
+    data: D,
 }
 
 struct Shared<BT: BackendTask> {
@@ -77,9 +76,10 @@ struct Shared<BT: BackendTask> {
     expiration_tx: watch::Sender<SystemTime>,
 }
 
-impl<K: Hash + Eq + Clone + Send + 'static + Sync + Debug, BT: BackendTask> Queue<K, BT> {
+impl<K, BT: BackendTask, D> Queue<K, BT, D> {
     pub(super) fn new(
         access_key: K,
+        data: D,
         max_active: NonZeroUsize,
         max_idle: Duration,
         initial_expiration: SystemTime,
@@ -130,11 +130,16 @@ impl<K: Hash + Eq + Clone + Send + 'static + Sync + Debug, BT: BackendTask> Queu
             activity_tx,
             shared,
             access_key,
+            data,
         }
     }
 
-    pub fn access_key(&self) -> K {
-        self.access_key.clone()
+    pub fn access_key(&self) -> &K {
+        &self.access_key
+    }
+
+    pub fn data(&self) -> &D {
+        &self.data
     }
 
     pub(crate) fn is_active(&self) -> bool {
