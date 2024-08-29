@@ -250,7 +250,7 @@ pub(crate) trait ResourceManager: Sized {
 
     fn advise<'a>(
         &self,
-        stats: &'a QueueState,
+        state: &'a QueueState,
         data: &mut Self::AdviseData,
     ) -> Result<(Duration, Option<Action<'a>>)>;
 }

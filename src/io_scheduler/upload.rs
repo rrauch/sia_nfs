@@ -61,7 +61,7 @@ impl ResourceManager for Upload {
 
     fn advise<'a>(
         &self,
-        _stats: &'a QueueState,
+        _state: &'a QueueState,
         _data: &mut Self::AdviseData,
     ) -> anyhow::Result<(Duration, Option<Action<'a>>)> {
         let next_consultation = Duration::from_secs(10);

@@ -93,14 +93,14 @@ impl ResourceManager for Download {
 
     fn advise<'a>(
         &self,
-        stats: &'a QueueState,
+        state: &'a QueueState,
         _data: &mut Self::AdviseData,
     ) -> Result<(Duration, Option<Action<'a>>)> {
-        assert!(!stats.waiting.is_empty());
+        assert!(!state.waiting.is_empty());
         // first, check if we need to free idle resources
-        if stats.active.len() + stats.preparing.len() + stats.idle.len() >= self.max_active {
+        if state.active.len() + state.preparing.len() + state.idle.len() >= self.max_active {
             // find the resource that has been idle the longest
-            if let Some(idle) = stats.idle.iter().min_by_key(|i| i.since) {
+            if let Some(idle) = state.idle.iter().min_by_key(|i| i.since) {
                 return Ok((Duration::from_millis(0), Some(Action::Free(idle))));
             } else {
                 // nothing we can do now
@@ -109,7 +109,7 @@ impl ResourceManager for Download {
         }
 
         // get the wait resource with the lowest offset
-        let waiting = stats.waiting.iter().min_by_key(|w| w.offset).unwrap();
+        let waiting = state.waiting.iter().min_by_key(|w| w.offset).unwrap();
         if waiting.offset == 0 {
             // no need to wait here
             return Ok((
@@ -126,7 +126,7 @@ impl ResourceManager for Download {
             return Ok((next_try_in, None));
         }
 
-        if stats.active.get_before_offset(waiting.offset).count() == 0 {
+        if state.active.get_before_offset(waiting.offset).count() == 0 {
             // start new download now
             return Ok((
                 Duration::from_millis(250),
