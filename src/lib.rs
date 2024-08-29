@@ -49,7 +49,6 @@ impl SiaNfs {
                     Duration::from_millis(800),
                     Duration::from_millis(200),
                     Duration::from_secs(5),
-                    Some((250, Duration::from_secs(120), Duration::from_secs(60))),
                 ),
             )
             .await?,

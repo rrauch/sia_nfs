@@ -7,7 +7,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures_util::{AsyncReadExt, AsyncWriteExt};
-use moka::future::{Cache, CacheBuilder};
 use nfsserve::nfs::nfsstat3::{
     NFS3ERR_IO, NFS3ERR_ISDIR, NFS3ERR_NOENT, NFS3ERR_NOTDIR, NFS3ERR_NOTSUPP, NFS3ERR_SERVERFAULT,
 };
@@ -24,7 +23,6 @@ pub(crate) struct SiaNfsFs {
     vfs: Arc<Vfs>,
     downloader: Scheduler<Download>,
     uploader: Scheduler<Upload>,
-    read_cache: Option<Cache<(fileid3, u64, u32), (Vec<u8>, bool)>>,
 }
 
 impl SiaNfsFs {
@@ -35,7 +33,6 @@ impl SiaNfsFs {
         download_max_wait_for_match: Duration,
         download_min_wait_for_match: Duration,
         upload_max_idle: Duration,
-        read_cache: Option<(u64, Duration, Duration)>,
     ) -> Self {
         let downloader = Download::new(
             vfs.clone(),
@@ -50,16 +47,36 @@ impl SiaNfsFs {
             downloader,
             uploader,
             vfs,
-            read_cache: read_cache.map(|(max_capacity, ttl, tti)| {
-                CacheBuilder::new(max_capacity)
-                    .time_to_live(ttl)
-                    .time_to_idle(tti)
-                    .build()
-            }),
         }
     }
+}
 
-    async fn _read(
+#[async_trait]
+impl NFSFileSystem for SiaNfsFs {
+    fn capabilities(&self) -> VFSCapabilities {
+        VFSCapabilities::ReadWrite
+    }
+
+    fn root_dir(&self) -> fileid3 {
+        self.vfs.root().id()
+    }
+
+    #[instrument(skip(self))]
+    async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
+        Ok(self.inode_by_dir_name(dirid, filename).await?.id())
+    }
+
+    async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
+        Ok(to_fattr3(&self.inode_by_id(id).await?))
+    }
+
+    async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
+        tracing::debug!("setattr called");
+        Ok(to_fattr3(&self.inode_by_id(id).await?))
+    }
+
+    #[instrument(skip(self))]
+    async fn read(
         &self,
         id: fileid3,
         offset: u64,
@@ -107,47 +124,6 @@ impl SiaNfsFs {
         })?;
 
         Ok((buf, dl.eof()))
-    }
-}
-
-#[async_trait]
-impl NFSFileSystem for SiaNfsFs {
-    fn capabilities(&self) -> VFSCapabilities {
-        VFSCapabilities::ReadWrite
-    }
-
-    fn root_dir(&self) -> fileid3 {
-        self.vfs.root().id()
-    }
-
-    #[instrument(skip(self))]
-    async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
-        Ok(self.inode_by_dir_name(dirid, filename).await?.id())
-    }
-
-    async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
-        Ok(to_fattr3(&self.inode_by_id(id).await?))
-    }
-
-    async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
-        tracing::debug!("setattr called");
-        Ok(to_fattr3(&self.inode_by_id(id).await?))
-    }
-
-    #[instrument(skip(self))]
-    async fn read(
-        &self,
-        id: fileid3,
-        offset: u64,
-        count: u32,
-    ) -> Result<(Vec<u8>, bool), nfsstat3> {
-        match &self.read_cache {
-            Some(cache) => cache
-                .try_get_with((id, offset, count), self._read(id, offset, count))
-                .await
-                .map_err(|e| e.as_ref().clone()),
-            None => self._read(id, offset, count).await,
-        }
     }
 
     #[instrument(skip(self, data), fields(count = data.len()))]
