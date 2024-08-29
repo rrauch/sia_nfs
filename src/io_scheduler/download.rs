@@ -3,18 +3,17 @@ use crate::vfs::file_reader::FileReader;
 use crate::vfs::inode::{File, Inode};
 use crate::vfs::Vfs;
 
+use crate::io_scheduler::strategy::DownloadStrategy;
 use anyhow::bail;
 use anyhow::Result;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use tracing::instrument;
 
 pub(crate) struct Download {
     vfs: Arc<Vfs>,
-    max_active: usize,
-    max_wait_for_match: Duration,
-    min_wait_for_match: Duration,
+    download_strategy: DownloadStrategy,
 }
 
 impl Download {
@@ -28,9 +27,11 @@ impl Download {
     ) -> Scheduler<Self> {
         let downloader = Download {
             vfs,
-            max_active: max_downloads.get(),
-            max_wait_for_match,
-            min_wait_for_match,
+            download_strategy: DownloadStrategy::new(
+                max_downloads.get(),
+                max_wait_for_match,
+                min_wait_for_match,
+            ),
         };
 
         Scheduler::new(downloader, true, max_queue_idle, max_resource_idle, 2)
@@ -96,57 +97,7 @@ impl ResourceManager for Download {
         state: &'a QueueState,
         _data: &mut Self::AdviseData,
     ) -> Result<(Duration, Option<Action<'a>>)> {
-        assert!(!state.waiting.is_empty());
-        // first, check if we need to free idle resources
-        if state.active.len() + state.preparing.len() + state.idle.len() >= self.max_active {
-            // find the resource that has been idle the longest
-            if let Some(idle) = state.idle.iter().min_by_key(|i| i.since) {
-                return Ok((Duration::from_millis(0), Some(Action::Free(idle))));
-            } else {
-                // nothing we can do now
-                return Ok((Duration::from_millis(250), None));
-            }
-        }
-
-        // get the wait resource with the lowest offset
-        let waiting = state.waiting.iter().min_by_key(|w| w.offset).unwrap();
-        if waiting.offset == 0 {
-            // no need to wait here
-            return Ok((
-                Duration::from_millis(250),
-                Some(Action::NewResource(waiting)),
-            ));
-        }
-        let wait_duration = SystemTime::now()
-            .duration_since(waiting.since)
-            .unwrap_or_default();
-        if wait_duration < self.min_wait_for_match {
-            let next_try_in = (self.min_wait_for_match - wait_duration) + Duration::from_millis(1);
-            // check later
-            return Ok((next_try_in, None));
-        }
-
-        if state.active.get_before_offset(waiting.offset).count() == 0 {
-            // start new download now
-            return Ok((
-                Duration::from_millis(250),
-                Some(Action::NewResource(waiting)),
-            ));
-        }
-
-        let wait_duration = SystemTime::now()
-            .duration_since(waiting.since)
-            .unwrap_or_default();
-        if wait_duration < self.max_wait_for_match {
-            let next_try_in = (self.max_wait_for_match - wait_duration) + Duration::from_millis(1);
-            // check later
-            return Ok((next_try_in, None));
-        }
-
-        Ok((
-            Duration::from_millis(250),
-            Some(Action::NewResource(waiting)),
-        ))
+        self.download_strategy.advise(state)
     }
 }
 
