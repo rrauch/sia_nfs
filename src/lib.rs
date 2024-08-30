@@ -42,14 +42,7 @@ impl SiaNfs {
         Ok(Self {
             listener: NFSTcpListener::bind(
                 listen_address,
-                SiaNfsFs::new(
-                    vfs,
-                    NonZeroUsize::new(5).unwrap(),
-                    Duration::from_millis(500),
-                    Duration::from_millis(800),
-                    Duration::from_millis(200),
-                    Duration::from_secs(5),
-                ),
+                SiaNfsFs::new(vfs, Duration::from_secs(5)),
             )
             .await?,
         })

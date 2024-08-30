@@ -1,11 +1,11 @@
 mod cache;
-pub(crate) mod file_reader;
+mod file_reader;
 pub(crate) mod file_writer;
 pub(crate) mod inode;
-mod locking;
+pub(crate) mod locking;
 
 use crate::vfs::cache::CacheManager;
-use crate::vfs::file_reader::FileReader;
+use crate::vfs::file_reader::{FileReader, FileReaderManager};
 use crate::vfs::file_writer::FileWriter;
 use crate::vfs::inode::{Directory, File, Inode, InodeManager, InodeType};
 use crate::vfs::locking::{LockHolder, LockManager, LockRequest};
@@ -24,8 +24,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{watch, Semaphore};
-use tokio::time::timeout;
+use tokio::sync::watch;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::{info, instrument};
 
@@ -35,10 +34,10 @@ pub(crate) struct Vfs {
     renterd: RenterdClient,
     inode_manager: InodeManager,
     root: Directory,
-    download_limiter: Arc<Semaphore>,
     lock_manager: LockManager,
     cache_manager: CacheManager,
     pending_writes: Arc<PendingWrites>,
+    file_reader_manager: FileReaderManager,
 }
 
 impl Vfs {
@@ -84,13 +83,17 @@ impl Vfs {
             })?;
 
         let inode_manager = InodeManager::new(db, ROOT_ID, buckets).await?;
-        let download_limiter = Arc::new(Semaphore::new(max_concurrent_downloads.get()));
+        let file_reader_manager = FileReaderManager::new(
+            renterd.clone(),
+            max_concurrent_downloads,
+            1024 * 32,
+            1024 * 1024 * 100,
+        )?;
 
         Ok(Self {
             renterd,
             inode_manager,
             root: Directory::new(ROOT_ID, "root".to_string(), Utc::now(), ROOT_ID),
-            download_limiter,
             lock_manager: LockManager::new(Duration::from_secs(30)),
             cache_manager: CacheManager::new(
                 10_000,
@@ -100,6 +103,7 @@ impl Vfs {
                 Duration::from_secs(10),
             ),
             pending_writes: Arc::new(PendingWrites::new()),
+            file_reader_manager,
         })
     }
 
@@ -409,11 +413,7 @@ impl Vfs {
         self.inode_manager.sync_dir(dir_id, stream).await
     }
 
-    pub async fn read_file(
-        &self,
-        file: &File,
-        offset: impl Into<Option<u64>>,
-    ) -> Result<FileReader> {
+    pub async fn read_file(&self, file: &File) -> Result<FileReader> {
         let (bucket, path) = self
             .inode_to_bucket_path(Inode::File(file.clone()))
             .await?
@@ -430,34 +430,10 @@ impl Vfs {
             _ => unreachable!("not a read lock"),
         };
 
-        tracing::trace!("waiting for download permit");
-        let download_permit = timeout(
-            Duration::from_secs(60),
-            self.download_limiter.clone().acquire_owned(),
-        )
-        .await??;
-        tracing::trace!("download permit acquired");
-
-        let object = self
-            .renterd
-            .worker()
-            .object()
-            .download(path, Some(bucket))
-            .await?
-            .ok_or(anyhow!("renterd couldn't find the file"))?;
-
-        let offset = offset.into().unwrap_or(0);
-        let size = object.length.ok_or(anyhow!("file size is unknown"))?;
-        let stream = object.open_seekable_stream(offset).await?;
-
-        Ok(FileReader::new(
-            file.clone(),
-            size,
-            offset,
-            stream,
-            read_lock,
-            download_permit,
-        ))
+        Ok(self
+            .file_reader_manager
+            .open_reader(bucket, path, file.size(), read_lock)
+            .await?)
     }
 
     pub async fn write_file(

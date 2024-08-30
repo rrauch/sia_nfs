@@ -13,9 +13,8 @@ use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 use tracing::instrument;
 
-pub(crate) mod download;
-mod queue;
-mod strategy;
+pub(crate) mod queue;
+pub(crate) mod strategy;
 pub(crate) mod upload;
 
 pub(crate) struct Scheduler<RM: ResourceManager>
@@ -41,7 +40,7 @@ where
 }
 
 impl<RM: ResourceManager + 'static + Send + Sync> Scheduler<RM> {
-    fn new(
+    pub(crate) fn new(
         resource_manager: RM,
         allow_existing_queue: bool,
         max_queue_idle: Duration,

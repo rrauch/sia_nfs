@@ -1,4 +1,3 @@
-use crate::io_scheduler::download::Download;
 use crate::io_scheduler::upload::Upload;
 use crate::io_scheduler::Scheduler;
 use crate::vfs::inode::{Inode, InodeType};
@@ -6,7 +5,7 @@ use crate::vfs::Vfs;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use futures_util::{AsyncReadExt, AsyncWriteExt};
+use futures_util::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use nfsserve::nfs::nfsstat3::{
     NFS3ERR_IO, NFS3ERR_ISDIR, NFS3ERR_NOENT, NFS3ERR_NOTDIR, NFS3ERR_NOTSUPP, NFS3ERR_SERVERFAULT,
 };
@@ -14,40 +13,20 @@ use nfsserve::nfs::{
     fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3,
 };
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
-use std::num::NonZeroUsize;
+use std::io::SeekFrom;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::instrument;
 
 pub(crate) struct SiaNfsFs {
     vfs: Arc<Vfs>,
-    downloader: Scheduler<Download>,
     uploader: Scheduler<Upload>,
 }
 
 impl SiaNfsFs {
-    pub(super) fn new(
-        vfs: Arc<Vfs>,
-        max_downloads_per_file: NonZeroUsize,
-        download_max_idle: Duration,
-        download_max_wait_for_match: Duration,
-        download_min_wait_for_match: Duration,
-        upload_max_idle: Duration,
-    ) -> Self {
-        let downloader = Download::new(
-            vfs.clone(),
-            download_max_idle,
-            download_max_idle,
-            max_downloads_per_file,
-            download_max_wait_for_match,
-            download_min_wait_for_match,
-        );
+    pub(super) fn new(vfs: Arc<Vfs>, upload_max_idle: Duration) -> Self {
         let uploader = Upload::new(vfs.clone(), upload_max_idle);
-        Self {
-            downloader,
-            uploader,
-            vfs,
-        }
+        Self { uploader, vfs }
     }
 }
 
@@ -100,30 +79,29 @@ impl NFSFileSystem for SiaNfsFs {
         if count == 0 {
             return Ok((vec![], true));
         }
-        let id = file.id();
-        let file_id = self.downloader.prepare(&id).await.map_err(|e| {
-            tracing::error!(error = %e, "failed to prepare download for file {}", id);
+
+        let mut file_reader = self.vfs.read_file(&file).await.map_err(|e| {
+            tracing::error!(error = %e, "failed to call read_file for file {}", id);
             NFS3ERR_SERVERFAULT
         })?;
-
-        let mut dl = self
-            .downloader
-            .access(&file_id, offset)
+        let _ = file_reader
+            .seek(SeekFrom::Start(offset))
             .await
             .map_err(|e| {
-                tracing::error!(error = %e, "failed to acquire download handle for file {}", file.id());
+                tracing::error!(error = %e, "failed to seek to offset {} for file {}", offset, id);
                 NFS3ERR_SERVERFAULT
             })?;
-        let dl = dl.as_mut();
 
         let mut buf = Vec::with_capacity(count);
         buf.resize(buf.capacity(), 0x00);
-        dl.read_exact(&mut buf).await.map_err(|e| {
+        file_reader.read_exact(&mut buf).await.map_err(|e| {
             tracing::error!(error = %e, "read error");
             NFS3ERR_IO
         })?;
 
-        Ok((buf, dl.eof()))
+        let eof = file_reader.eof();
+
+        Ok((buf, file_reader.eof()))
     }
 
     #[instrument(skip(self, data), fields(count = data.len()))]

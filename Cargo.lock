@@ -2038,6 +2038,7 @@ dependencies = [
  "async-recursion",
  "async-trait",
  "bimap",
+ "bytes",
  "chrono",
  "clap",
  "futures",

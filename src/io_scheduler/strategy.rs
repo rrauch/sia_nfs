@@ -1,7 +1,7 @@
 use crate::io_scheduler::{Action, QueueState};
 use std::time::{Duration, SystemTime};
 
-pub(super) struct DownloadStrategy {
+pub(crate) struct DownloadStrategy {
     max_active: usize,
     max_wait_for_match: Duration,
     min_wait_for_match: Duration,
