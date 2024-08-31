@@ -20,6 +20,9 @@ struct Arguments {
     /// Directory path to store persistent data. Will be created if it doesn't exist.
     #[arg(long, short = 'p', env)]
     data_path: PathBuf,
+    /// Directory path to store the content cache. Will be created if it doesn't exist.
+    #[arg(long, short = 'c', env)]
+    cache_path: PathBuf,
     /// Host and port to listen on.
     #[arg(long, short = 'l', env)]
     #[clap(default_value = "localhost:12000")]
@@ -43,13 +46,18 @@ async fn main() -> anyhow::Result<()> {
     let arguments = Arguments::parse();
 
     tokio::fs::create_dir_all(&arguments.data_path).await?;
-
     let db_path = arguments.data_path.join("sia_nfs.sqlite");
+
+    tokio::fs::create_dir_all(&arguments.cache_path).await?;
+    let cache_db_path = arguments.cache_path.join("sia_cache.sqlite");
 
     let sia_nfs = SiaNfs::new(
         &arguments.renterd_api_endpoint,
         &arguments.renterd_api_password,
         &db_path,
+        &cache_db_path,
+        32768,
+        1024 * 1024 * 1024 * 2,
         arguments.buckets,
         &arguments.listen_address,
     )

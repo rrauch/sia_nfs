@@ -12,6 +12,7 @@ use crate::vfs::locking::{LockHolder, LockManager, LockRequest};
 use crate::SqlitePool;
 use anyhow::{anyhow, bail, Result};
 use async_recursion::async_recursion;
+use cachalot::Cachalot;
 use chrono::Utc;
 use futures::pin_mut;
 use futures_util::io::Cursor;
@@ -41,16 +42,13 @@ pub(crate) struct Vfs {
 }
 
 impl Vfs {
-    pub(super) async fn new<T, I>(
+    pub(super) async fn new(
         renterd: RenterdClient,
         db: SqlitePool,
-        buckets: T,
+        buckets: &Vec<String>,
         max_concurrent_downloads: NonZeroUsize,
-    ) -> Result<Self>
-    where
-        T: IntoIterator<Item = I>,
-        I: ToString,
-    {
+        cachalot: Option<Cachalot>,
+    ) -> Result<Self> {
         // get all available buckets from renterd
         let available_buckets = renterd
             .bus()
@@ -88,6 +86,7 @@ impl Vfs {
             max_concurrent_downloads,
             1024 * 32,
             1024 * 1024 * 100,
+            cachalot,
         )?;
 
         Ok(Self {

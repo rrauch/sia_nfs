@@ -5,11 +5,12 @@ mod vfs;
 use crate::nfs::SiaNfsFs;
 use crate::vfs::Vfs;
 use anyhow::Result;
+use cachalot::Cachalot;
 use futures::{AsyncRead, AsyncSeek};
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{ConnectOptions, Pool, Sqlite};
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,6 +27,9 @@ impl SiaNfs {
         renterd_endpoint: &Url,
         renterd_password: &str,
         db_path: &Path,
+        cache_db_path: &Path,
+        page_size: u32,
+        cache_size: u64,
         buckets: Vec<String>,
         listen_address: &str,
     ) -> Result<Self> {
@@ -35,9 +39,27 @@ impl SiaNfs {
             .verbose_logging(true)
             .build()?;
 
+        let cachalot = Cachalot::new(
+            cache_db_path,
+            page_size,
+            NonZeroU64::try_from(cache_size / page_size as u64)?,
+            10,
+            &buckets,
+        )
+        .await?;
+
         let db = db_init(db_path, 20, true).await?;
 
-        let vfs = Arc::new(Vfs::new(renterd, db, buckets, NonZeroUsize::new(25).unwrap()).await?);
+        let vfs = Arc::new(
+            Vfs::new(
+                renterd,
+                db,
+                &buckets,
+                NonZeroUsize::new(25).unwrap(),
+                Some(cachalot),
+            )
+            .await?,
+        );
 
         Ok(Self {
             listener: NFSTcpListener::bind(

@@ -1,8 +1,16 @@
 [workspace]
 resolver = "2"
-members = [
+members = [ "cachalot",
     "main",
 ]
+
+[workspace.dependencies]
+anyhow = { version = "1.0" }
+bytes = "1.7"
+chrono = "0.4"
+sqlx = { version = "0.8" }
+tokio = { version = "1.39" }
+tracing = "0.1"
 
 [patch.crates-io]
 nfsserve = { git = "https://github.com/rrauch/nfsserve.git", rev = "57327866361b35c63829ee31cb0fdb4b9f07c08b" }

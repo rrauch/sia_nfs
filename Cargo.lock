@@ -287,6 +287,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cachalot"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "chrono",
+ "sqlx",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "cc"
 version = "1.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2039,6 +2051,7 @@ dependencies = [
  "async-trait",
  "bimap",
  "bytes",
+ "cachalot",
  "chrono",
  "clap",
  "futures",

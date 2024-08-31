@@ -1,0 +1,15 @@
+[package]
+name = "cachalot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true, features = ["backtrace"] }
+bytes = { workspace = true }
+chrono = { workspace = true }
+sqlx = { workspace = true, features = ["runtime-tokio-rustls", "sqlite", "migrate", "chrono"] }
+tracing = { workspace = true }
+
+[build-dependencies]
+sqlx = { workspace = true, features = ["runtime-tokio-rustls", "sqlite", "migrate", "chrono"] }
+tokio = { workspace = true, features = ["full"] }

@@ -246,7 +246,10 @@ impl NFSFileSystem for SiaNfsFs {
             .vfs
             .read_dir(&dir)
             .await
-            .map_err(|_| NFS3ERR_SERVERFAULT)?;
+            .map_err(|err| {
+                tracing::error!(error = %err, "read_dir failed");
+                NFS3ERR_SERVERFAULT
+            })?;
 
         let mut ret = ReadDirResult {
             entries: Vec::new(),

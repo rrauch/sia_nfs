@@ -4,12 +4,14 @@ use crate::io_scheduler::{ResourceManager, Scheduler};
 use crate::vfs::file_reader::renterd_download::RenterdDownload;
 use crate::vfs::locking::ReadLock;
 use bytes::{Buf, Bytes};
+use cachalot::Cachalot;
 use futures::{ready, AsyncRead, AsyncSeek};
 use futures_util::future::BoxFuture;
 use futures_util::{AsyncReadExt, FutureExt};
 use moka::future::{Cache, CacheBuilder};
 use renterd_client::Client;
 use std::cmp::min;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{Cursor, ErrorKind, SeekFrom};
 use std::num::NonZeroUsize;
 use std::pin::Pin;
@@ -21,6 +23,7 @@ pub(crate) struct FileReaderManager {
     scheduler: Arc<Scheduler<RenterdDownload>>,
     page_size: usize,
     l1_cache: Cache<(<RenterdDownload as ResourceManager>::AccessKey, u64, usize), Bytes>,
+    cachalot: Option<Arc<Cachalot>>,
 }
 
 impl FileReaderManager {
@@ -29,6 +32,7 @@ impl FileReaderManager {
         max_concurrent_downloads: NonZeroUsize,
         page_size: usize,
         l1_cache_size: u64,
+        cachalot: Option<Cachalot>,
     ) -> anyhow::Result<Self> {
         let scheduler = RenterdDownload::new(
             renterd,
@@ -48,6 +52,7 @@ impl FileReaderManager {
             scheduler: Arc::new(scheduler),
             page_size,
             l1_cache,
+            cachalot: cachalot.map(|c| Arc::new(c)),
         })
     }
 
@@ -63,6 +68,7 @@ impl FileReaderManager {
             path,
             self.scheduler.clone(),
             self.l1_cache.clone(),
+            self.cachalot.clone(),
             size,
             self.page_size,
             read_lock,
@@ -74,6 +80,7 @@ impl FileReaderManager {
 pub struct FileReader {
     scheduler: Arc<Scheduler<RenterdDownload>>,
     cache: Cache<(<RenterdDownload as ResourceManager>::AccessKey, u64, usize), Bytes>,
+    cachalot: Option<Arc<Cachalot>>,
     access_key: <RenterdDownload as ResourceManager>::AccessKey,
     offset: u64,
     size: u64,
@@ -89,6 +96,7 @@ impl FileReader {
         path: String,
         scheduler: Arc<Scheduler<RenterdDownload>>,
         cache: Cache<(<RenterdDownload as ResourceManager>::AccessKey, u64, usize), Bytes>,
+        cachalot: Option<Arc<Cachalot>>,
         size: u64,
         page_size: usize,
         read_lock: ReadLock,
@@ -99,6 +107,7 @@ impl FileReader {
             scheduler,
             access_key,
             cache,
+            cachalot,
             offset: 0,
             size,
             page_size,
@@ -125,7 +134,9 @@ impl FileReader {
             let fut = get_bytes(
                 self.cache.clone(),
                 self.scheduler.clone(),
+                self.cachalot.clone(),
                 self.access_key.clone(),
+                required_page,
                 required_page * self.page_size as u64,
                 self.page_size,
             )
@@ -163,20 +174,42 @@ impl FileReader {
 async fn get_bytes(
     cache: Cache<(<RenterdDownload as ResourceManager>::AccessKey, u64, usize), Bytes>,
     scheduler: Arc<Scheduler<RenterdDownload>>,
+    cachalot: Option<Arc<Cachalot>>,
     access_key: <RenterdDownload as ResourceManager>::AccessKey,
+    page: u64,
     offset: u64,
     size: usize,
 ) -> anyhow::Result<Bytes> {
     let cache_key = (access_key.clone(), offset, size);
     cache
         .try_get_with(cache_key, async {
-            _get_bytes(scheduler, access_key.clone(), offset, size).await
+            let mut hasher = DefaultHasher::new();
+            access_key.hash(&mut hasher);
+            let version = Bytes::from(hasher.finish().to_le_bytes().to_vec());
+            let (bucket, path, ..) = &access_key;
+
+            if let Some(cachalot) = cachalot.as_ref() {
+                // first, try cachalot
+                if let Some(content) = cachalot.get(bucket, path, version.clone(), page).await? {
+                    return Ok(content);
+                }
+            }
+            // try to get from renterd
+            let content = get_from_renterd(scheduler, access_key.clone(), offset, size).await?;
+
+            if let Some(cachalot) = cachalot.as_ref() {
+                cachalot
+                    .put(bucket, path, version, page, content.clone())
+                    .await?;
+            }
+
+            Ok(content)
         })
         .await
         .map_err(|e: Arc<anyhow::Error>| anyhow::anyhow!(e))
 }
 
-async fn _get_bytes(
+async fn get_from_renterd(
     scheduler: Arc<Scheduler<RenterdDownload>>,
     access_key: <RenterdDownload as ResourceManager>::AccessKey,
     offset: u64,
