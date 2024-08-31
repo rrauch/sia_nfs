@@ -381,28 +381,26 @@ impl Vfs {
         bucket: String,
         path: String,
     ) -> Result<(Vec<Inode>, Vec<u64>)> {
-        let stream = match self
-            .renterd
-            .bus()
-            .object()
-            .get_stream(
-                path.as_str(),
-                NonZeroUsize::new(1000).unwrap(),
-                None,
-                Some(bucket.clone()),
-            )
-            .await?
-            .ok_or(anyhow!("path not found"))?
-        {
-            Either::Left(_file) => bail!("expected a directory but got a file"),
-            Either::Right(stream) => stream,
-        };
+        let stream = self.renterd.bus().object().list(
+            NonZeroUsize::new(1000).unwrap(),
+            Some(path.clone()),
+            Some(bucket.clone()),
+        )?;
 
         let stream = stream
             .try_filter_map(|m| async {
                 Ok(Some(
                     m.into_iter()
                         .filter_map(|m| Inode::try_from((m, path.as_str(), dir_id)).ok())
+                        .filter(|i| {
+                            // filter out all entries that do not belong to this directory
+                            let name = i.name();
+                            if name.is_empty() || name.contains("/") {
+                                false
+                            } else {
+                                true
+                            }
+                        })
                         .collect_vec(),
                 ))
             })
