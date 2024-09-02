@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = { workspace = true, features = ["backtrace"] }
+blake3 = "1.5"
 bytes = { workspace = true }
 chrono = { workspace = true }
 sqlx = { workspace = true, features = ["runtime-tokio-rustls", "sqlite", "migrate", "chrono"] }

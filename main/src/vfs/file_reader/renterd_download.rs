@@ -3,7 +3,6 @@ use crate::io_scheduler::{Action, QueueState, Resource, ResourceManager, Schedul
 use crate::ReadStream;
 use anyhow::Result;
 use anyhow::{anyhow, bail};
-use chrono::{DateTime, FixedOffset};
 use futures::{AsyncRead, AsyncSeek};
 use renterd_client::worker::object::DownloadableObject;
 use renterd_client::Client;
@@ -16,6 +15,8 @@ use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 use tracing::instrument;
+
+const VERSION_HASH_SEED: u64 = 3986469829483842332;
 
 pub(super) struct RenterdDownload {
     renterd: Client,
@@ -47,7 +48,12 @@ impl RenterdDownload {
         Scheduler::new(renterd_download, true, max_queue_idle, max_resource_idle, 2)
     }
 
-    async fn download(&self, known_dl: &DownloadableObject, offset: u64) -> Result<ObjectReader> {
+    async fn download(
+        &self,
+        known_dl: &DownloadableObject,
+        known_version: &Version,
+        offset: u64,
+    ) -> Result<ObjectReader> {
         tracing::trace!("waiting for download permit");
         let download_permit = timeout(
             Duration::from_secs(60),
@@ -56,33 +62,15 @@ impl RenterdDownload {
         .await??;
         tracing::trace!("download permit acquired");
 
-        let new_dl = self
+        let (new_dl, new_version) = self
             .dl_object(
                 known_dl.bucket.as_ref().unwrap().to_string(),
                 &known_dl.path,
             )
             .await?;
 
-        if &new_dl.length != &known_dl.length {
-            bail!(
-                "file size has changed, expected {:?}, actual {:?}",
-                known_dl.length,
-                new_dl.length
-            );
-        }
-        if &new_dl.etag != &known_dl.etag {
-            bail!(
-                "etag has changed, expected {:?}, actual {:?}",
-                known_dl.etag,
-                new_dl.etag
-            )
-        }
-        if &new_dl.last_modified != &known_dl.last_modified {
-            bail!(
-                "last_modified has changed, expected {:?}, actual {:?}",
-                known_dl.last_modified,
-                new_dl.last_modified
-            )
+        if &new_version != known_version {
+            bail!("file version has changed, cannot continue");
         }
 
         tracing::trace!(
@@ -112,7 +100,7 @@ impl RenterdDownload {
         })
     }
 
-    async fn dl_object(&self, bucket: String, path: &str) -> Result<DownloadableObject> {
+    async fn dl_object(&self, bucket: String, path: &str) -> Result<(DownloadableObject, Version)> {
         let dl_object = self
             .renterd
             .worker()
@@ -127,21 +115,56 @@ impl RenterdDownload {
 
         dl_object.length.ok_or(anyhow!("file size is unknown"))?;
 
-        Ok(dl_object)
+        let version = Version::from(&dl_object);
+
+        Ok((dl_object, version))
+    }
+}
+
+#[derive(Clone, Hash, PartialEq, Eq, Debug)]
+pub struct Version(u128);
+
+impl From<&Version> for Vec<u8> {
+    fn from(value: &Version) -> Self {
+        value.0.to_le_bytes().to_vec()
+    }
+}
+
+impl From<&DownloadableObject> for Version {
+    fn from(dl_object: &DownloadableObject) -> Self {
+        // derive version from available object metadata
+        let mut hasher = xxhash_rust::xxh3::Xxh3::with_seed(VERSION_HASH_SEED);
+        hasher.update("renterd object version v1 start\n".as_bytes());
+        hasher.update("length:".as_bytes());
+        hasher.update(dl_object.length.unwrap().to_le_bytes().as_slice());
+        hasher.update("\netag:".as_bytes());
+        if let Some(etag) = dl_object.etag.as_ref() {
+            hasher.update(etag.as_bytes());
+        } else {
+            hasher.update("None".as_bytes());
+        }
+        hasher.update("\nlast_modified:".as_bytes());
+        if let Some(last_modified) = dl_object.last_modified.as_ref() {
+            hasher.update(last_modified.timestamp_millis().to_le_bytes().as_slice());
+        } else {
+            hasher.update("None".as_bytes());
+        }
+        hasher.update("\ncontent_type:".as_bytes());
+        if let Some(content_type) = dl_object.content_type.as_ref() {
+            hasher.update(content_type.as_bytes());
+        } else {
+            hasher.update("None".as_bytes());
+        }
+        hasher.update("\nrenterd object version v1 end".as_bytes());
+        Version(hasher.digest128())
     }
 }
 
 impl ResourceManager for RenterdDownload {
     type Resource = ObjectReader;
     type PreparationKey = (String, String);
-    type AccessKey = (
-        String,
-        String,
-        u64,
-        Option<String>,
-        Option<DateTime<FixedOffset>>,
-    );
-    type ResourceData = DownloadableObject;
+    type AccessKey = (String, String, Version);
+    type ResourceData = (DownloadableObject, Version);
     type AdviseData = ();
 
     async fn prepare(
@@ -154,24 +177,18 @@ impl ResourceManager for RenterdDownload {
         Vec<Self::Resource>,
     )> {
         let (bucket, path) = preparation_key;
-        let dl_object = self.dl_object(bucket.clone(), path).await?;
+        let (dl_object, version) = self.dl_object(bucket.clone(), path).await?;
 
         Ok((
-            (
-                bucket.clone(),
-                path.clone(),
-                dl_object.length.unwrap(),
-                dl_object.etag.clone(),
-                dl_object.last_modified.clone(),
-            ),
-            dl_object,
+            (bucket.clone(), path.clone(), version.clone()),
+            (dl_object, version),
             (),
             vec![],
         ))
     }
 
     async fn new_resource(&self, offset: u64, data: &Self::ResourceData) -> Result<Self::Resource> {
-        self.download(data, offset).await
+        self.download(&data.0, &data.1, offset).await
     }
 
     fn advise<'a>(

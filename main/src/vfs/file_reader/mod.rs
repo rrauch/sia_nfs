@@ -11,7 +11,6 @@ use futures_util::{AsyncReadExt, FutureExt};
 use moka::future::{Cache, CacheBuilder};
 use renterd_client::Client;
 use std::cmp::min;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{Cursor, ErrorKind, SeekFrom};
 use std::num::NonZeroUsize;
 use std::pin::Pin;
@@ -150,7 +149,10 @@ impl FileReader {
 
         let mut cursor = match res {
             Ok(bytes) => Cursor::new(bytes),
-            Err(_) => return Poll::Ready(Err(std::io::Error::from(ErrorKind::Other))),
+            Err(err) => {
+                tracing::error!(error = %err, "error preparing data");
+                return Poll::Ready(Err(std::io::Error::from(ErrorKind::Other)))
+            },
         };
 
         if cursor.get_ref().len() <= relative_offset {
@@ -183,14 +185,12 @@ async fn get_bytes(
     let cache_key = (access_key.clone(), offset, size);
     cache
         .try_get_with(cache_key, async {
-            let mut hasher = DefaultHasher::new();
-            access_key.hash(&mut hasher);
-            let version = Bytes::from(hasher.finish().to_le_bytes().to_vec());
-            let (bucket, path, ..) = &access_key;
+            let (bucket, path, version) = &access_key;
+            let version: Vec<u8> = version.into();
 
             if let Some(cachalot) = cachalot.as_ref() {
                 // first, try cachalot
-                if let Some(content) = cachalot.get(bucket, path, version.clone(), page).await? {
+                if let Some(content) = cachalot.get(bucket, path, version.as_ref(), page).await? {
                     return Ok(content);
                 }
             }
@@ -199,7 +199,7 @@ async fn get_bytes(
 
             if let Some(cachalot) = cachalot.as_ref() {
                 cachalot
-                    .put(bucket, path, version, page, content.clone())
+                    .put(bucket, path, version.as_ref(), page, content.clone())
                     .await?;
             }
 

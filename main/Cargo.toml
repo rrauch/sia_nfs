@@ -25,6 +25,7 @@ tokio-util = "0.7"
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.5"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [build-dependencies]
 sqlx = { workspace = true, features = ["runtime-tokio-rustls", "sqlite", "migrate", "chrono"] }

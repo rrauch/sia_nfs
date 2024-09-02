@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail};
+use blake3::Hash;
 use bytes::Bytes;
 use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{ConnectOptions, Pool, Sqlite};
@@ -9,6 +10,10 @@ use tracing::log::LevelFilter;
 use tracing::Instrument;
 
 const VALID_PAGE_SIZES: [u32; 8] = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536];
+const CONTENT_HASH_SEED: [u8; 32] = [
+    0xf9, 0xa2, 0x9a, 0xe8, 0xe1, 0xe3, 0x26, 0x91, 0x57, 0xab, 0x79, 0x15, 0x92, 0xc9, 0x6f, 0x2e,
+    0x92, 0xef, 0xfd, 0x66, 0x59, 0x85, 0xc0, 0xd3, 0x32, 0xc7, 0x13, 0x35, 0xb4, 0x71, 0x29, 0x14,
+];
 
 pub struct Cachalot {
     db: SqlitePool,
@@ -36,16 +41,16 @@ impl Cachalot {
         &self,
         bucket: &str,
         path: &str,
-        version: Bytes,
+        version: &[u8],
         page: u64,
     ) -> anyhow::Result<Option<Bytes>> {
-        let version = version.as_ref();
         let page = page as i64;
         Ok(sqlx::query!(
             "
-        SELECT p.content
-        FROM pages p
-        JOIN files f ON p.file_id = f.id
+        SELECT c.content
+        FROM files f
+        JOIN pages p ON f.id = p.file_id
+        JOIN content c ON p.content_hash = c.content_hash
         WHERE f.bucket = ? AND f.path = ? AND f.version = ? AND p.page_nr = ?",
             bucket,
             path,
@@ -61,15 +66,26 @@ impl Cachalot {
         &self,
         bucket: &str,
         path: &str,
-        version: Bytes,
+        version: &[u8],
         page: u64,
         content: Bytes,
     ) -> anyhow::Result<()> {
-        let version = version.as_ref();
         let page = page as i64;
         let content = content.as_ref();
+        let content_hash = content_hash(content);
+        let content_hash = content_hash.as_bytes().as_slice();
 
         let mut tx = self.db.write().begin().await?;
+        // delete any other version of this file first
+        sqlx::query!(
+            "DELETE FROM files WHERE bucket = ? AND path = ? and version != ?",
+            bucket,
+            path,
+            version
+        )
+        .execute(tx.as_mut())
+        .await?;
+
         sqlx::query!(
             "
             INSERT INTO files (bucket, path, version)
@@ -83,17 +99,30 @@ impl Cachalot {
         .await?;
 
         sqlx::query!(
-            "INSERT INTO pages (file_id, page_nr, content)
+            "
+            INSERT INTO content (content_hash, content)
+            VALUES (?, ?)
+                ON CONFLICT(content_hash) DO NOTHING;
+            ",
+            content_hash,
+            content
+        )
+        .execute(tx.as_mut())
+        .await?;
+
+        sqlx::query!(
+            "
+            INSERT INTO pages (file_id, page_nr, content_hash)
             VALUES (
                 (SELECT id FROM files WHERE bucket = ? AND path = ? AND version = ?),
                 ?, ?
             )
-            ON CONFLICT (file_id, page_nr) DO UPDATE SET content = excluded.content;",
+            ON CONFLICT (file_id, page_nr) DO UPDATE SET content_hash = excluded.content_hash;",
             bucket,
             path,
             version,
             page,
-            content
+            content_hash,
         )
         .execute(tx.as_mut())
         .await?;
@@ -194,6 +223,17 @@ async fn current_page_size(db: &Pool<Sqlite>) -> anyhow::Result<u32> {
         .page_size
         .map(|p| p as u32)
         .ok_or(anyhow!("cannot get page_size from database"))?)
+}
+
+fn content_hash(content: &[u8]) -> Hash {
+    let mut hasher = blake3::Hasher::new_keyed(&CONTENT_HASH_SEED);
+    hasher.update("cachalot content hash v1 start\n".as_bytes());
+    hasher.update("length:".as_bytes());
+    hasher.update(content.len().to_le_bytes().as_slice());
+    hasher.update("\ncontent:".as_bytes());
+    hasher.update(content);
+    hasher.update("\ncachalot content hash v1 end".as_bytes());
+    hasher.finalize()
 }
 
 #[derive(Debug, Clone)]
