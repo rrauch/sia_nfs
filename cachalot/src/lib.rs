@@ -1,10 +1,13 @@
 use anyhow::{anyhow, bail};
 use blake3::Hash;
 use bytes::Bytes;
+use moka::future::{Cache, CacheBuilder};
 use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{ConnectOptions, Pool, Sqlite};
-use std::num::NonZeroU64;
-use std::path::Path;
+use std::future::Future;
+use std::num::{NonZeroU64, NonZeroU8};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::log::LevelFilter;
 use tracing::Instrument;
@@ -16,24 +19,187 @@ const CONTENT_HASH_SEED: [u8; 32] = [
 ];
 
 pub struct Cachalot {
+    mem_cache: Cache<(String, String, Bytes, u64), Bytes>,
+    disk_cache: Option<DiskCache>,
+    page_size: usize,
+}
+
+pub struct PageSize(u32);
+impl TryFrom<u32> for PageSize {
+    type Error = u32;
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        if !VALID_PAGE_SIZES.contains(&value) {
+            return Err(value);
+        }
+        Ok(PageSize(value))
+    }
+}
+
+pub struct CachalotBuilder {
+    buckets: Vec<String>,
+    page_size: u32,
+    max_mem_cache: u64,
+    disk_cache: Option<(PathBuf, u64, u8)>,
+}
+
+impl CachalotBuilder {
+    pub fn with_disk_cache<P: AsRef<Path>, S: TryInto<NonZeroU64>, C: TryInto<NonZeroU8>>(
+        mut self,
+        db_file: P,
+        max_size: S,
+        max_connections: C,
+    ) -> anyhow::Result<Self> {
+        self.disk_cache = Some((
+            db_file.as_ref().to_path_buf(),
+            max_size
+                .try_into()
+                .map_err(|_| anyhow!("max_size cannot be zero"))?
+                .get(),
+            max_connections
+                .try_into()
+                .map_err(|_| anyhow!("max_connections cannot be zero"))?
+                .get(),
+        ));
+        Ok(self)
+    }
+
+    pub fn page_size<P: TryInto<PageSize>>(mut self, page_size: P) -> anyhow::Result<Self> {
+        self.page_size = page_size
+            .try_into()
+            .map_err(|_| anyhow!("page_size invalid"))?
+            .0;
+        Ok(self)
+    }
+
+    pub fn max_mem_cache<M: TryInto<NonZeroU64>>(
+        mut self,
+        max_mem_cache: M,
+    ) -> anyhow::Result<Self> {
+        self.max_mem_cache = max_mem_cache
+            .try_into()
+            .map_err(|_| anyhow!("max_mem_cache cannot be zero"))?
+            .get();
+        Ok(self)
+    }
+
+    pub async fn build(self) -> anyhow::Result<Cachalot> {
+        if self.max_mem_cache < self.page_size as u64 {
+            bail!("max_mem_cache cannot be smaller than page size");
+        }
+
+        let mem_cache = CacheBuilder::new(self.max_mem_cache)
+            .weigher(|_, v: &Bytes| v.len() as u32)
+            .build();
+
+        let disk_cache = if let Some((path, max_size, max_connections)) = self.disk_cache {
+            if max_size < self.page_size as u64 {
+                bail!("max_disk_cache cannot be smaller than page size");
+            }
+            let max_pages = max_size / self.page_size as u64;
+            Some(
+                DiskCache::new(
+                    path.as_path(),
+                    self.page_size,
+                    max_pages,
+                    max_connections,
+                    self.buckets,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+
+        Ok(Cachalot {
+            mem_cache,
+            disk_cache,
+            page_size: self.page_size as usize,
+        })
+    }
+}
+
+impl Cachalot {
+    pub fn builder<I, T>(buckets: I) -> CachalotBuilder
+    where
+        I: IntoIterator<Item = T>,
+        T: AsRef<str>,
+    {
+        CachalotBuilder {
+            buckets: buckets
+                .into_iter()
+                .map(|s| s.as_ref().to_string())
+                .collect(),
+            page_size: PageSize::try_from(32768).unwrap().0,
+            max_mem_cache: 1024 * 1024 * 100,
+            disk_cache: None,
+        }
+    }
+
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+
+    pub async fn try_get_with<F>(
+        &self,
+        bucket: &str,
+        path: &str,
+        version: Bytes,
+        page: u64,
+        init: F,
+    ) -> anyhow::Result<Bytes>
+    where
+        F: Future<Output = anyhow::Result<Bytes>>,
+    {
+        Ok(self
+            .mem_cache
+            .try_get_with::<_, anyhow::Error>(
+                (bucket.to_string(), path.to_string(), version.clone(), page),
+                async {
+                    let version: Vec<u8> = version.into();
+
+                    if let Some(disk_cache) = self.disk_cache.as_ref() {
+                        if let Some(content) =
+                            disk_cache.get(bucket, path, version.as_ref(), page).await?
+                        {
+                            return Ok(content);
+                        }
+                    }
+
+                    let content = init.await?;
+
+                    if let Some(disk_cache) = self.disk_cache.as_ref() {
+                        disk_cache
+                            .put(bucket, path, version.as_ref(), page, content.clone())
+                            .await?;
+                    }
+
+                    Ok(content)
+                },
+            )
+            .await
+            .map_err(|e: Arc<anyhow::Error>| anyhow::anyhow!(e))?)
+    }
+}
+
+struct DiskCache {
     db: SqlitePool,
     page_size: u32,
     max_pages: u64,
 }
 
-impl Cachalot {
-    pub async fn new(
+impl DiskCache {
+    async fn new(
         db_file: &Path,
         page_size: u32,
-        max_pages: NonZeroU64,
+        max_pages: u64,
         max_db_connections: u8,
-        buckets: &Vec<String>,
+        buckets: Vec<String>,
     ) -> anyhow::Result<Self> {
-        let db = db_init(db_file, page_size, max_db_connections, true, buckets).await?;
+        let db = db_init(db_file, page_size, max_db_connections, true, &buckets).await?;
         Ok(Self {
             db,
             page_size,
-            max_pages: max_pages.get(),
+            max_pages,
         })
     }
 
@@ -139,10 +305,6 @@ async fn db_init(
     create_if_missing: bool,
     buckets: &Vec<String>,
 ) -> anyhow::Result<SqlitePool> {
-    if !VALID_PAGE_SIZES.contains(&page_size) {
-        bail!("invalid page size: {}", page_size);
-    }
-
     let writer = SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with({

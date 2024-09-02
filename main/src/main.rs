@@ -56,7 +56,6 @@ async fn main() -> anyhow::Result<()> {
         &arguments.renterd_api_password,
         &db_path,
         &cache_db_path,
-        32768,
         1024 * 1024 * 1024 * 2,
         arguments.buckets,
         &arguments.listen_address,

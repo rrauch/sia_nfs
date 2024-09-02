@@ -8,6 +8,7 @@ anyhow = { workspace = true, features = ["backtrace"] }
 blake3 = "1.5"
 bytes = { workspace = true }
 chrono = { workspace = true }
+moka = { workspace = true, features = ["future"] }
 sqlx = { workspace = true, features = ["runtime-tokio-rustls", "sqlite", "migrate", "chrono"] }
 tracing = { workspace = true }
 

@@ -1,15 +1,16 @@
 [workspace]
 resolver = "2"
-members = [ "cachalot",
+members = ["cachalot",
     "main",
 ]
 
 [workspace.dependencies]
-anyhow = { version = "1.0" }
+anyhow = "1.0"
 bytes = "1.7"
 chrono = "0.4"
-sqlx = { version = "0.8" }
-tokio = { version = "1.39" }
+moka = "0.12"
+sqlx = "0.8"
+tokio = "1.39"
 tracing = "0.1"
 
 [patch.crates-io]

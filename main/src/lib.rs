@@ -10,7 +10,7 @@ use futures::{AsyncRead, AsyncSeek};
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{ConnectOptions, Pool, Sqlite};
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,8 +28,7 @@ impl SiaNfs {
         renterd_password: &str,
         db_path: &Path,
         cache_db_path: &Path,
-        page_size: u32,
-        cache_size: u64,
+        disk_cache_size: u64,
         buckets: Vec<String>,
         listen_address: &str,
     ) -> Result<Self> {
@@ -39,14 +38,10 @@ impl SiaNfs {
             .verbose_logging(true)
             .build()?;
 
-        let cachalot = Cachalot::new(
-            cache_db_path,
-            page_size,
-            NonZeroU64::try_from(cache_size / page_size as u64)?,
-            10,
-            &buckets,
-        )
-        .await?;
+        let cachalot = Cachalot::builder(&buckets)
+            .with_disk_cache(cache_db_path, disk_cache_size, 25)?
+            .build()
+            .await?;
 
         let db = db_init(db_path, 20, true).await?;
 
@@ -56,7 +51,7 @@ impl SiaNfs {
                 db,
                 &buckets,
                 NonZeroUsize::new(25).unwrap(),
-                Some(cachalot),
+                cachalot,
             )
             .await?,
         );

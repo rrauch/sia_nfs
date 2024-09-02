@@ -47,7 +47,7 @@ impl Vfs {
         db: SqlitePool,
         buckets: &Vec<String>,
         max_concurrent_downloads: NonZeroUsize,
-        cachalot: Option<Cachalot>,
+        cachalot: Cachalot,
     ) -> Result<Self> {
         // get all available buckets from renterd
         let available_buckets = renterd
@@ -81,13 +81,8 @@ impl Vfs {
             })?;
 
         let inode_manager = InodeManager::new(db, ROOT_ID, buckets).await?;
-        let file_reader_manager = FileReaderManager::new(
-            renterd.clone(),
-            max_concurrent_downloads,
-            1024 * 32,
-            1024 * 1024 * 100,
-            cachalot,
-        )?;
+        let file_reader_manager =
+            FileReaderManager::new(renterd.clone(), max_concurrent_downloads, cachalot)?;
 
         Ok(Self {
             renterd,
