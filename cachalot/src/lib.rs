@@ -1,14 +1,19 @@
 use anyhow::{anyhow, bail};
 use blake3::Hash;
 use bytes::Bytes;
+use futures_util::stream::TryStreamExt;
 use moka::future::{Cache, CacheBuilder};
 use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::{ConnectOptions, Pool, Sqlite};
+use sqlx::{ConnectOptions, Pool, Sqlite, Transaction};
+use std::cmp::{max, min};
 use std::future::Future;
 use std::num::{NonZeroU64, NonZeroU8};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
+use tokio::fs;
+use tokio::fs::remove_file;
+use tokio::task::JoinHandle;
 use tracing::log::LevelFilter;
 use tracing::Instrument;
 
@@ -19,7 +24,7 @@ const CONTENT_HASH_SEED: [u8; 32] = [
 ];
 
 pub struct Cachalot {
-    mem_cache: Cache<(String, String, Bytes, u64), Bytes>,
+    mem_cache: Cache<(String, String, u64, u64), Bytes>,
     disk_cache: Option<DiskCache>,
     page_size: usize,
 }
@@ -143,7 +148,7 @@ impl Cachalot {
         &self,
         bucket: &str,
         path: &str,
-        version: Bytes,
+        version: u64,
         page: u64,
         init: F,
     ) -> anyhow::Result<Bytes>
@@ -153,14 +158,10 @@ impl Cachalot {
         Ok(self
             .mem_cache
             .try_get_with::<_, anyhow::Error>(
-                (bucket.to_string(), path.to_string(), version.clone(), page),
+                (bucket.to_string(), path.to_string(), version, page),
                 async {
-                    let version: Vec<u8> = version.into();
-
                     if let Some(disk_cache) = self.disk_cache.as_ref() {
-                        if let Some(content) =
-                            disk_cache.get(bucket, path, version.as_ref(), page).await?
-                        {
+                        if let Some(content) = disk_cache.get(bucket, path, version, page).await? {
                             return Ok(content);
                         }
                     }
@@ -169,7 +170,7 @@ impl Cachalot {
 
                     if let Some(disk_cache) = self.disk_cache.as_ref() {
                         disk_cache
-                            .put(bucket, path, version.as_ref(), page, content.clone())
+                            .put(bucket, path, version, page, content.clone())
                             .await?;
                     }
 
@@ -183,8 +184,15 @@ impl Cachalot {
 
 struct DiskCache {
     db: SqlitePool,
+    max_size: u64,
     page_size: u32,
-    max_pages: u64,
+    _housekeeping: JoinHandle<()>,
+}
+
+impl Drop for DiskCache {
+    fn drop(&mut self) {
+        self._housekeeping.abort();
+    }
 }
 
 impl DiskCache {
@@ -196,10 +204,21 @@ impl DiskCache {
         buckets: Vec<String>,
     ) -> anyhow::Result<Self> {
         let db = db_init(db_file, page_size, max_db_connections, true, &buckets).await?;
+
+        let max_size = max_pages * page_size as u64;
+        // 10% of max size, but between 1MiB and 1GiB
+        let min_free = min(max(max_size / 10, 1024 * 1024), 1024 * 1024 * 1024);
+
+        let _housekeeping = {
+            let db = db.clone();
+            tokio::spawn(async move { housekeeping(db, max_size as i64, min_free as i64).await })
+        };
+
         Ok(Self {
             db,
+            max_size,
             page_size,
-            max_pages,
+            _housekeeping,
         })
     }
 
@@ -207,10 +226,11 @@ impl DiskCache {
         &self,
         bucket: &str,
         path: &str,
-        version: &[u8],
+        version: u64,
         page: u64,
     ) -> anyhow::Result<Option<Bytes>> {
         let page = page as i64;
+        let version = version as i64;
         Ok(sqlx::query!(
             "
         SELECT c.content
@@ -232,11 +252,12 @@ impl DiskCache {
         &self,
         bucket: &str,
         path: &str,
-        version: &[u8],
+        version: u64,
         page: u64,
         content: Bytes,
     ) -> anyhow::Result<()> {
         let page = page as i64;
+        let version = version as i64;
         let content = content.as_ref();
         let content_hash = content_hash(content);
         let content_hash = content_hash.as_bytes().as_slice();
@@ -251,6 +272,20 @@ impl DiskCache {
         )
         .execute(tx.as_mut())
         .await?;
+
+        let extra_space_needed = {
+            let free_after =
+                self.max_size as i64 - used_space(&mut tx).await? as i64 - self.page_size as i64;
+            if free_after < 0 {
+                free_after * -1
+            } else {
+                0
+            }
+        } as u64;
+
+        if extra_space_needed > 0 {
+            let _ = try_free_space(extra_space_needed, &mut tx).await?;
+        }
 
         sqlx::query!(
             "
@@ -298,6 +333,108 @@ impl DiskCache {
     }
 }
 
+async fn try_free_space(
+    min_bytes_to_free: u64,
+    tx: &mut Transaction<'_, Sqlite>,
+) -> anyhow::Result<u64> {
+    let used_before = used_space(tx).await?;
+
+    let mut bytes_needed = min_bytes_to_free;
+    let mut content_hashes = vec![];
+
+    let mut stream = sqlx::query!(
+        "
+            SELECT content_hash, content_length
+            FROM content
+            ORDER BY last_referenced ASC, num_pages ASC"
+    )
+    .fetch(tx.as_mut());
+
+    while let Some(res) = stream.try_next().await? {
+        content_hashes.push(res.content_hash);
+        bytes_needed = bytes_needed.saturating_sub(res.content_length as u64);
+        if bytes_needed == 0 {
+            break;
+        }
+    }
+    drop(stream);
+
+    if bytes_needed != 0 {
+        bail!(
+            "unable to free enough space; '{}' missing to reach minimum required '{}'",
+            bytes_needed,
+            min_bytes_to_free
+        );
+    }
+
+    for content_hash in content_hashes {
+        sqlx::query!("DELETE FROM content WHERE content_hash = ?", content_hash)
+            .execute(tx.as_mut())
+            .await?;
+    }
+
+    let used_after = used_space(tx).await?;
+    let actual_freed = used_before - used_after;
+    if actual_freed < min_bytes_to_free {
+        bail!(
+            "unable to free enough space; minimum required '{}' <> '{}' actual",
+            min_bytes_to_free,
+            actual_freed
+        );
+    }
+
+    tracing::debug!("freed {} bytes from disk cache", actual_freed);
+
+    Ok(actual_freed)
+}
+
+async fn used_space(tx: &mut Transaction<'_, Sqlite>) -> anyhow::Result<u64> {
+    Ok(sqlx::query!("SELECT total_size FROM content_stats")
+        .fetch_one(tx.as_mut())
+        .await?
+        .total_size as u64)
+}
+
+async fn housekeeping(db: SqlitePool, max_size: i64, min_free: i64) {
+    let mut next_run_in = Duration::from_secs(300);
+    let mut next_vacuum = SystemTime::now() + Duration::from_secs(3600);
+    loop {
+        tokio::time::sleep(next_run_in).await;
+        next_run_in = Duration::from_secs(300);
+        if let Err(err) = hk_free_space(&db, max_size, min_free).await {
+            tracing::error!(error = %err, "error trying to free space in disk cache");
+            next_run_in = Duration::from_secs(900);
+        } else {
+            next_vacuum = SystemTime::now();
+        }
+        if next_vacuum <= SystemTime::now() {
+            let _ = sqlx::query!("VACUUM").execute(db.write()).await;
+            next_vacuum = SystemTime::now() + Duration::from_secs(3600);
+        }
+    }
+}
+
+async fn hk_free_space(db: &SqlitePool, max_size: i64, min_free: i64) -> anyhow::Result<()> {
+    let mut tx = db.writer.begin().await?;
+
+    let extra_space_needed = {
+        let free = max_size - used_space(&mut tx).await? as i64;
+        if free <= min_free {
+            min_free - free
+        } else {
+            0
+        }
+    } as u64;
+
+    if extra_space_needed > 0 {
+        tracing::info!("freeing extra {} bytes from disk cache", extra_space_needed);
+        let space_freed = try_free_space(extra_space_needed, &mut tx).await?;
+        tracing::info!("{} bytes freed", space_freed);
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 async fn db_init(
     db_file: &Path,
     page_size: u32,
@@ -305,36 +442,73 @@ async fn db_init(
     create_if_missing: bool,
     buckets: &Vec<String>,
 ) -> anyhow::Result<SqlitePool> {
-    let writer = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with({
-            SqliteConnectOptions::new()
-                .create_if_missing(create_if_missing)
-                .page_size(page_size)
-                .filename(db_file)
-                .log_statements(LevelFilter::Trace)
-                // `auto_vacuum` needs to be executed before `journal_mode`
-                .auto_vacuum(SqliteAutoVacuum::Full)
-                .journal_mode(SqliteJournalMode::Wal)
-                .busy_timeout(Duration::from_millis(100))
-                .shared_cache(true)
-        })
-        .await?;
+    let mut attempt = 0;
+    let writer = loop {
+        attempt += 1;
+        let writer = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with({
+                SqliteConnectOptions::new()
+                    .create_if_missing(create_if_missing)
+                    .page_size(page_size)
+                    .filename(db_file)
+                    .log_statements(LevelFilter::Trace)
+                    // `auto_vacuum` needs to be executed before `journal_mode`
+                    .auto_vacuum(SqliteAutoVacuum::Full)
+                    .journal_mode(SqliteJournalMode::Wal)
+                    .busy_timeout(Duration::from_millis(100))
+                    .shared_cache(true)
+            })
+            .await?;
 
-    async { sqlx::migrate!("./migrations").run(&writer).await }
-        .instrument(tracing::warn_span!("db_migration"))
-        .await?;
+        async { sqlx::migrate!("./migrations").run(&writer).await }
+            .instrument(tracing::warn_span!("db_migration"))
+            .await?;
 
-    // check the page size
-    let current_page_size = current_page_size(&writer).await?;
+        // check the page size
+        let current_page_size = current_page_size(&writer).await?;
+        if page_size == current_page_size {
+            // all good
+            break writer;
+        }
 
-    if current_page_size != page_size {
-        bail!(
-            "database file has incompatible page size, {} != {}",
-            current_page_size,
-            page_size
-        );
-    }
+        writer.close().await;
+        drop(writer);
+
+        if attempt > 1 {
+            // we already tried to recreate the database once
+            // something is wrong here, cannot continue
+            bail!(
+                "unable to create the database at path {} with page_size {}",
+                db_file.display(),
+                page_size
+            );
+        }
+        // delete the database file and recreate it
+        tracing::info!("database at {} has wrong page_size ({} <> {}), it will be deleted and recreated with the correct page size", db_file.display(), current_page_size, page_size);
+
+        let wal_path = db_file
+            .with_extension("")
+            .with_file_name(format!("{}-wal", db_file.display()));
+        let shm_path = db_file
+            .with_extension("")
+            .with_file_name(format!("{}-shm", db_file.display()));
+
+        tracing::info!("deleting {}", db_file.display());
+        remove_file(db_file).await?;
+
+        if fs::metadata(&wal_path).await.is_ok() {
+            tracing::info!("deleting {}", wal_path.display());
+            remove_file(&wal_path).await?;
+        }
+
+        if fs::metadata(&shm_path).await.is_ok() {
+            tracing::info!("deleting {}", shm_path.display());
+            remove_file(&shm_path).await?;
+        }
+
+        continue;
+    };
 
     let db_buckets = sqlx::query!("SELECT DISTINCT bucket FROM files")
         .fetch_all(&writer)

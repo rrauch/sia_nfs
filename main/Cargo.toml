@@ -13,7 +13,7 @@ cachalot = { path = "../cachalot" }
 chrono = { workspace = true }
 clap = { version = "4.5", features = ["derive", "env"] }
 futures = "0.3"
-futures-util = "0.3"
+futures-util = { workspace = true }
 itertools = "0.13"
 moka = { workspace = true, features = ["future"] }
 nfsserve = "0.10"

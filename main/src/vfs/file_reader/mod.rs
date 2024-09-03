@@ -161,8 +161,6 @@ async fn get_bytes(
     page: u64,
 ) -> anyhow::Result<Bytes> {
     let (bucket, path, version) = &access_key;
-    let version: Vec<u8> = version.into();
-    let version = Bytes::from(version);
     let page_size = cachalot.page_size();
     let offset = page_size as u64 * page;
 
@@ -170,7 +168,7 @@ async fn get_bytes(
         .try_get_with(
             bucket,
             path,
-            version,
+            version.as_u64(),
             page,
             get_from_renterd(scheduler, access_key.clone(), offset, page_size),
         )

@@ -6,6 +6,7 @@ use anyhow::{anyhow, bail};
 use futures::{AsyncRead, AsyncSeek};
 use renterd_client::worker::object::DownloadableObject;
 use renterd_client::Client;
+use std::hash::Hasher;
 use std::io::SeekFrom;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
@@ -122,11 +123,11 @@ impl RenterdDownload {
 }
 
 #[derive(Clone, Hash, PartialEq, Eq, Debug)]
-pub struct Version(u128);
+pub struct Version(u64);
 
-impl From<&Version> for Vec<u8> {
-    fn from(value: &Version) -> Self {
-        value.0.to_le_bytes().to_vec()
+impl Version {
+    pub fn as_u64(&self) -> u64 {
+        self.0
     }
 }
 
@@ -156,7 +157,7 @@ impl From<&DownloadableObject> for Version {
             hasher.update("None".as_bytes());
         }
         hasher.update("\nrenterd object version v1 end".as_bytes());
-        Version(hasher.digest128())
+        Version(hasher.finish())
     }
 }
 
