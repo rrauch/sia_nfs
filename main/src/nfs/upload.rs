@@ -1,4 +1,4 @@
-use crate::io_scheduler::{Action, ResourceManager, Resource, QueueState, Scheduler};
+use crate::io_scheduler::{Action, QueueState, Resource, ResourceManager, Scheduler};
 use crate::vfs::file_writer::FileWriter;
 use crate::vfs::inode::Inode;
 use crate::vfs::Vfs;
@@ -55,7 +55,11 @@ impl ResourceManager for Upload {
         Ok((file.id(), (), (), vec![fw]))
     }
 
-    async fn new_resource(&self, _offset: u64, _data: &Self::ResourceData) -> anyhow::Result<Self::Resource> {
+    async fn new_resource(
+        &self,
+        _offset: u64,
+        _data: &Self::ResourceData,
+    ) -> anyhow::Result<Self::Resource> {
         bail!("upload queues cannot start new resources")
     }
 

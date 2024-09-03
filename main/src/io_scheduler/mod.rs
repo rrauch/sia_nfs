@@ -15,7 +15,6 @@ use tracing::instrument;
 
 pub(crate) mod queue;
 pub(crate) mod strategy;
-pub(crate) mod upload;
 
 pub(crate) struct Scheduler<RM: ResourceManager>
 where

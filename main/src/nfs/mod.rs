@@ -1,5 +1,7 @@
-use crate::io_scheduler::upload::Upload;
+mod upload;
+
 use crate::io_scheduler::Scheduler;
+use crate::nfs::upload::Upload;
 use crate::vfs::inode::{Inode, InodeType};
 use crate::vfs::Vfs;
 use anyhow::Result;
@@ -242,14 +244,10 @@ impl NFSFileSystem for SiaNfsFs {
             _ => return Err(NFS3ERR_NOTDIR),
         };
 
-        let inodes = self
-            .vfs
-            .read_dir(&dir)
-            .await
-            .map_err(|err| {
-                tracing::error!(error = %err, "read_dir failed");
-                NFS3ERR_SERVERFAULT
-            })?;
+        let inodes = self.vfs.read_dir(&dir).await.map_err(|err| {
+            tracing::error!(error = %err, "read_dir failed");
+            NFS3ERR_SERVERFAULT
+        })?;
 
         let mut ret = ReadDirResult {
             entries: Vec::new(),
