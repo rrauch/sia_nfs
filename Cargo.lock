@@ -1680,8 +1680,8 @@ checksum = "7a66a03ae7c801facd77a29370b4faec201768915ac14a721ba36f20bc9c209b"
 
 [[package]]
 name = "renterd_client"
-version = "0.1.0"
-source = "git+https://github.com/rrauch/renterd_client.git?rev=b6c3d08fc4e78b1304365a9a898f23b60c344cc5#b6c3d08fc4e78b1304365a9a898f23b60c344cc5"
+version = "0.2.0"
+source = "git+https://github.com/rrauch/renterd_client.git?rev=79b42166ffdee6c4980b93462dd469777de97187#79b42166ffdee6c4980b93462dd469777de97187"
 dependencies = [
  "bandwidth",
  "bigdecimal",
@@ -1691,11 +1691,9 @@ dependencies = [
  "futures",
  "hex",
  "reqwest",
- "reqwest-file",
  "serde",
  "serde_json",
  "thiserror",
- "tokio-util",
  "url",
  "urlencoding",
  "zeroize",
@@ -1749,19 +1747,6 @@ dependencies = [
  "wasm-streams",
  "web-sys",
  "windows-registry",
-]
-
-[[package]]
-name = "reqwest-file"
-version = "0.2.1"
-source = "git+https://github.com/rrauch/renterd_client.git?rev=b6c3d08fc4e78b1304365a9a898f23b60c344cc5#b6c3d08fc4e78b1304365a9a898f23b60c344cc5"
-dependencies = [
- "bytes",
- "futures-util",
- "pin-project",
- "reqwest",
- "tokio",
- "tokio-util",
 ]
 
 [[package]]

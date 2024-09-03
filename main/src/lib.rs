@@ -6,7 +6,6 @@ use crate::nfs::SiaNfsFs;
 use crate::vfs::Vfs;
 use anyhow::Result;
 use cachalot::Cachalot;
-use futures::{AsyncRead, AsyncSeek};
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{ConnectOptions, Pool, Sqlite};
@@ -127,6 +126,3 @@ impl SqlitePool {
         &self.writer
     }
 }
-
-trait ReadStream: AsyncRead + AsyncSeek {}
-impl<T: AsyncRead + AsyncSeek> ReadStream for T {}

@@ -1,13 +1,11 @@
 use crate::io_scheduler::strategy::DownloadStrategy;
 use crate::io_scheduler::{Action, QueueState, Resource, ResourceManager, Scheduler};
-use crate::ReadStream;
 use anyhow::Result;
 use anyhow::{anyhow, bail};
-use futures::{AsyncRead, AsyncSeek};
+use futures::AsyncRead;
 use renterd_client::worker::object::DownloadableObject;
 use renterd_client::Client;
 use std::hash::Hasher;
-use std::io::SeekFrom;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -81,7 +79,7 @@ impl RenterdDownload {
             "opening new stream"
         );
 
-        let stream = new_dl.open_seekable_stream(offset).await?;
+        let stream = new_dl.open_stream(offset).await?;
 
         tracing::debug!(
             bucket = new_dl.bucket,
@@ -207,7 +205,7 @@ pub(crate) struct ObjectReader {
     offset: u64,
     size: u64,
     error_count: usize,
-    stream: Box<dyn ReadStream + Send + Unpin>,
+    stream: Box<dyn AsyncRead + Send + Unpin>,
     _download_permit: OwnedSemaphorePermit,
 }
 
@@ -222,27 +220,6 @@ impl AsyncRead for ObjectReader {
             match res {
                 Ok(bytes_read) => {
                     self.offset += *bytes_read as u64;
-                }
-                Err(_) => {
-                    self.error_count += 1;
-                }
-            }
-        }
-        result
-    }
-}
-
-impl AsyncSeek for ObjectReader {
-    fn poll_seek(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        pos: SeekFrom,
-    ) -> Poll<std::io::Result<u64>> {
-        let result = Pin::new(&mut self.stream).poll_seek(cx, pos);
-        if let Poll::Ready(res) = &result {
-            match res {
-                Ok(position) => {
-                    self.offset = *position;
                 }
                 Err(_) => {
                     self.error_count += 1;
