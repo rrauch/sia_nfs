@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail};
 use blake3::Hash;
 use bytes::Bytes;
+use chrono::Utc;
 use futures_util::stream::TryStreamExt;
 use moka::future::{Cache, CacheBuilder};
 use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
@@ -40,32 +41,62 @@ impl TryFrom<u32> for PageSize {
     }
 }
 
+pub struct DiskCacheBuilder {
+    path: PathBuf,
+    max_size: u64,
+    ttl: Duration,
+    max_connections: u8,
+    cachalot_builder: CachalotBuilder,
+}
+
+impl DiskCacheBuilder {
+    pub fn max_size<T: TryInto<NonZeroU64>>(mut self, max_size: T) -> anyhow::Result<Self> {
+        self.max_size = max_size
+            .try_into()
+            .map_err(|_| anyhow!("max_size invalid"))?
+            .get();
+        Ok(self)
+    }
+
+    pub fn ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = ttl;
+        self
+    }
+
+    pub fn max_connections<T: TryInto<NonZeroU8>>(
+        mut self,
+        max_connections: T,
+    ) -> anyhow::Result<Self> {
+        self.max_connections = max_connections
+            .try_into()
+            .map_err(|_| anyhow!("max_connections invalid"))?
+            .get();
+        Ok(self)
+    }
+
+    pub fn build(self) -> CachalotBuilder {
+        let mut cb = self.cachalot_builder;
+        cb.disk_cache = Some((self.path, self.max_size, self.ttl, self.max_connections));
+        cb
+    }
+}
+
 pub struct CachalotBuilder {
     buckets: Vec<String>,
     page_size: u32,
     max_mem_cache: u64,
-    disk_cache: Option<(PathBuf, u64, u8)>,
+    disk_cache: Option<(PathBuf, u64, Duration, u8)>,
 }
 
 impl CachalotBuilder {
-    pub fn with_disk_cache<P: AsRef<Path>, S: TryInto<NonZeroU64>, C: TryInto<NonZeroU8>>(
-        mut self,
-        db_file: P,
-        max_size: S,
-        max_connections: C,
-    ) -> anyhow::Result<Self> {
-        self.disk_cache = Some((
-            db_file.as_ref().to_path_buf(),
-            max_size
-                .try_into()
-                .map_err(|_| anyhow!("max_size cannot be zero"))?
-                .get(),
-            max_connections
-                .try_into()
-                .map_err(|_| anyhow!("max_connections cannot be zero"))?
-                .get(),
-        ));
-        Ok(self)
+    pub fn with_disk_cache<P: AsRef<Path>>(self, path: P) -> DiskCacheBuilder {
+        DiskCacheBuilder {
+            path: path.as_ref().to_path_buf(),
+            max_size: 1024 * 1024 * 1024,        // 1GiB
+            ttl: Duration::from_secs(86400 * 7), // 1 Week
+            max_connections: 10,
+            cachalot_builder: self,
+        }
     }
 
     pub fn page_size<P: TryInto<PageSize>>(mut self, page_size: P) -> anyhow::Result<Self> {
@@ -96,7 +127,7 @@ impl CachalotBuilder {
             .weigher(|_, v: &Bytes| v.len() as u32)
             .build();
 
-        let disk_cache = if let Some((path, max_size, max_connections)) = self.disk_cache {
+        let disk_cache = if let Some((path, max_size, ttl, max_connections)) = self.disk_cache {
             if max_size < self.page_size as u64 {
                 bail!("max_disk_cache cannot be smaller than page size");
             }
@@ -107,6 +138,7 @@ impl CachalotBuilder {
                     self.page_size,
                     max_pages,
                     max_connections,
+                    ttl,
                     self.buckets,
                 )
                 .await?,
@@ -201,6 +233,7 @@ impl DiskCache {
         page_size: u32,
         max_pages: u64,
         max_db_connections: u8,
+        ttl: Duration,
         buckets: Vec<String>,
     ) -> anyhow::Result<Self> {
         let db = db_init(db_file, page_size, max_db_connections, true, &buckets).await?;
@@ -211,7 +244,9 @@ impl DiskCache {
 
         let _housekeeping = {
             let db = db.clone();
-            tokio::spawn(async move { housekeeping(db, max_size as i64, min_free as i64).await })
+            tokio::spawn(
+                async move { housekeeping(db, max_size as i64, min_free as i64, ttl).await },
+            )
         };
 
         Ok(Self {
@@ -395,12 +430,29 @@ async fn used_space(tx: &mut Transaction<'_, Sqlite>) -> anyhow::Result<u64> {
         .total_size as u64)
 }
 
-async fn housekeeping(db: SqlitePool, max_size: i64, min_free: i64) {
+async fn housekeeping(db: SqlitePool, max_size: i64, min_free: i64, max_age: Duration) {
     let mut next_run_in = Duration::from_secs(300);
     let mut next_vacuum = SystemTime::now() + Duration::from_secs(3600);
+    let mut next_expired_removal = SystemTime::now() + Duration::from_secs(900);
+
     loop {
         tokio::time::sleep(next_run_in).await;
-        next_run_in = Duration::from_secs(300);
+        next_run_in = Duration::from_secs(60);
+        if next_expired_removal <= SystemTime::now() {
+            match remove_expired(&db, max_age).await {
+                Ok(removed) => {
+                    next_expired_removal = SystemTime::now() + Duration::from_secs(900);
+                    if removed {
+                        next_vacuum = SystemTime::now();
+                    }
+                }
+                Err(err) => {
+                    tracing::error!(error = %err, "error removing expired entries from disk cache");
+                    next_expired_removal = SystemTime::now() + Duration::from_secs(3600);
+                }
+            }
+        }
+
         if let Err(err) = hk_free_space(&db, max_size, min_free).await {
             tracing::error!(error = %err, "error trying to free space in disk cache");
             next_run_in = Duration::from_secs(900);
@@ -408,10 +460,23 @@ async fn housekeeping(db: SqlitePool, max_size: i64, min_free: i64) {
             next_vacuum = SystemTime::now();
         }
         if next_vacuum <= SystemTime::now() {
+            tracing::debug!("running VACUUM");
             let _ = sqlx::query!("VACUUM").execute(db.write()).await;
             next_vacuum = SystemTime::now() + Duration::from_secs(3600);
         }
     }
+}
+
+async fn remove_expired(db: &SqlitePool, max_age: Duration) -> anyhow::Result<bool> {
+    let deadline = Utc::now() - max_age;
+
+    Ok(
+        sqlx::query!("DELETE FROM content WHERE created <= ?", deadline)
+            .execute(db.write())
+            .await?
+            .rows_affected()
+            > 0,
+    )
 }
 
 async fn hk_free_space(db: &SqlitePool, max_size: i64, min_free: i64) -> anyhow::Result<()> {

@@ -71,6 +71,7 @@ CREATE TABLE content
 (
     content_hash    BLOB PRIMARY KEY NOT NULL CHECK (TYPEOF(content_hash) == 'blob' AND LENGTH(content_hash) == 32),
     content_length  INTEGER NOT NULL DEFAULT 0 CHECK (content_length >= 0),
+    created         TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
     last_referenced TIMESTAMP DEFAULT CURRENT_TIMESTAMP  NOT NULL,
     num_pages       INTEGER                    DEFAULT 0 NOT NULL,
     content         BLOB NOT NULL CHECK (TYPEOF(content) == 'blob')

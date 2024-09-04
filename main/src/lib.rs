@@ -38,7 +38,9 @@ impl SiaNfs {
             .build()?;
 
         let cachalot = Cachalot::builder(&buckets)
-            .with_disk_cache(cache_db_path, disk_cache_size, 25)?
+            .with_disk_cache(cache_db_path)
+            .max_size(disk_cache_size)?
+            .build()
             .build()
             .await?;
 
