@@ -1681,7 +1681,7 @@ checksum = "7a66a03ae7c801facd77a29370b4faec201768915ac14a721ba36f20bc9c209b"
 [[package]]
 name = "renterd_client"
 version = "0.2.0"
-source = "git+https://github.com/rrauch/renterd_client.git?rev=79b42166ffdee6c4980b93462dd469777de97187#79b42166ffdee6c4980b93462dd469777de97187"
+source = "git+https://github.com/rrauch/renterd_client.git?rev=11e947e7861e690c9d36ccf2702e0012c9f97eca#11e947e7861e690c9d36ccf2702e0012c9f97eca"
 dependencies = [
  "bandwidth",
  "bigdecimal",

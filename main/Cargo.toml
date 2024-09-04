@@ -18,7 +18,7 @@ itertools = "0.13"
 moka = { workspace = true, features = ["future"] }
 nfsserve = "0.10"
 parking_lot = "0.12"
-renterd_client = { git = "https://github.com/rrauch/renterd_client.git", rev = "79b42166ffdee6c4980b93462dd469777de97187" }
+renterd_client = { git = "https://github.com/rrauch/renterd_client.git", rev = "11e947e7861e690c9d36ccf2702e0012c9f97eca" }
 sqlx = { workspace = true, features = ["runtime-tokio-rustls", "sqlite", "migrate", "chrono"] }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { version = "0.7", features = ["compat"] }
