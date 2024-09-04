@@ -146,24 +146,3 @@ BEGIN
     SET last_referenced = CURRENT_TIMESTAMP
     WHERE content_hash = NEW.content_hash;
 END;
-
-CREATE TABLE content_stats
-(
-    total_size INTEGER DEFAULT 0 NOT NULL CHECK (total_size >= 0)
-);
-
-INSERT INTO content_stats (total_size) VALUES (0);
-
-CREATE TRIGGER update_content_stats_insert
-AFTER INSERT ON content
-BEGIN
-    UPDATE content_stats
-    SET total_size = total_size + LENGTH(NEW.content);
-END;
-
-CREATE TRIGGER update_content_stats_delete
-AFTER DELETE ON content
-BEGIN
-    UPDATE content_stats
-    SET total_size = total_size - LENGTH(OLD.content);
-END;
