@@ -518,8 +518,6 @@ async fn db_init(
                     .page_size(page_size)
                     .filename(db_file)
                     .log_statements(LevelFilter::Trace)
-                    // `auto_vacuum` needs to be executed before `journal_mode`
-                    .auto_vacuum(SqliteAutoVacuum::Full)
                     .journal_mode(SqliteJournalMode::Wal)
                     .busy_timeout(Duration::from_millis(100))
                     .shared_cache(true)
