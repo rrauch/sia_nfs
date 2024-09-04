@@ -10,6 +10,7 @@ use sqlx::FromRow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
+use std::sync::Arc;
 
 pub(super) struct InodeManager {
     db: SqlitePool,
@@ -463,51 +464,56 @@ impl FromStr for InodeType {
 }
 
 #[derive(PartialEq, Clone, Debug)]
-pub(crate) struct Directory {
-    id: u64,
-    name: String,
-    last_modified: DateTime<Utc>,
-    parent: u64,
-}
-
-impl Directory {
-    pub(super) fn new(id: u64, name: String, last_modified: DateTime<Utc>, parent: u64) -> Self {
-        Self {
-            id,
-            name,
-            last_modified,
-            parent,
-        }
-    }
-
-    pub fn id(&self) -> u64 {
-        self.id
-    }
-
-    pub(super) fn set_id(&mut self, id: u64) {
-        self.id = id;
-    }
-
-    pub fn name(&self) -> &str {
-        self.name.as_str()
-    }
-
-    pub fn last_modified(&self) -> &DateTime<Utc> {
-        &self.last_modified
-    }
-
-    pub fn parent(&self) -> u64 {
-        self.parent
-    }
-}
-
-#[derive(PartialEq, Clone, Debug)]
-pub(crate) struct File {
+struct InodeInner {
     id: u64,
     name: String,
     size: u64,
     last_modified: DateTime<Utc>,
     parent: u64,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub(crate) struct Directory {
+    inner: Arc<InodeInner>,
+}
+
+impl Directory {
+    pub(super) fn new(id: u64, name: String, last_modified: DateTime<Utc>, parent: u64) -> Self {
+        Self {
+            inner: Arc::new(InodeInner {
+                id,
+                name,
+                last_modified,
+                parent,
+                size: 0,
+            }),
+        }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.inner.id
+    }
+
+    pub(super) fn set_id(&mut self, id: u64) {
+        Arc::make_mut(&mut self.inner).id = id;
+    }
+
+    pub fn name(&self) -> &str {
+        self.inner.name.as_str()
+    }
+
+    pub fn last_modified(&self) -> &DateTime<Utc> {
+        &self.inner.last_modified
+    }
+
+    pub fn parent(&self) -> u64 {
+        self.inner.parent
+    }
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub(crate) struct File {
+    inner: Arc<InodeInner>,
 }
 
 impl File {
@@ -519,44 +525,46 @@ impl File {
         parent: u64,
     ) -> Self {
         Self {
-            id,
-            name,
-            size,
-            last_modified,
-            parent,
+            inner: Arc::new(InodeInner {
+                id,
+                name,
+                last_modified,
+                parent,
+                size,
+            }),
         }
     }
 
     pub fn id(&self) -> u64 {
-        self.id
+        self.inner.id
     }
 
     fn set_id(&mut self, id: u64) {
-        self.id = id;
+        Arc::make_mut(&mut self.inner).id = id;
     }
 
     pub fn name(&self) -> &str {
-        self.name.as_str()
+        self.inner.name.as_str()
     }
 
     pub fn size(&self) -> u64 {
-        self.size
+        self.inner.size
     }
 
     pub(super) fn set_size(&mut self, size: u64) {
-        self.size = size;
+        Arc::make_mut(&mut self.inner).size = size;
     }
 
     pub fn last_modified(&self) -> &DateTime<Utc> {
-        &self.last_modified
+        &self.inner.last_modified
     }
 
     pub(super) fn set_last_modified(&mut self, last_modified: DateTime<Utc>) {
-        self.last_modified = last_modified;
+        Arc::make_mut(&mut self.inner).last_modified = last_modified;
     }
 
     pub fn parent(&self) -> u64 {
-        self.parent
+        self.inner.parent
     }
 }
 
@@ -579,13 +587,7 @@ impl Inode {
             InodeType::Directory => {
                 Inode::Directory(Directory::new(id, name, last_modified, parent))
             }
-            InodeType::File => Inode::File(File {
-                id,
-                name,
-                size,
-                last_modified,
-                parent,
-            }),
+            InodeType::File => Inode::File(File::new(id, name, size, last_modified, parent)),
         }
     }
 
