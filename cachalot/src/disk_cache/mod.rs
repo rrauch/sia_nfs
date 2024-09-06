@@ -10,11 +10,11 @@ use sqlx::{ConnectOptions, Sqlite, Transaction};
 use std::cmp::{max, min};
 use std::num::{NonZeroU64, NonZeroU8};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
 use tokio::fs::remove_file;
+use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing::log::LevelFilter;
 use tracing::Instrument;
@@ -81,7 +81,7 @@ struct Config {
     page_size: u32,
     min_free_pages: u32,
     ttl: Duration,
-    usable_pages_est: Arc<AtomicU32>,
+    usable_pages_est: Arc<RwLock<u32>>,
 }
 
 impl Config {
@@ -98,7 +98,7 @@ impl Config {
             page_size,
             min_free_pages,
             ttl,
-            usable_pages_est: Arc::new(AtomicU32::new(0)),
+            usable_pages_est: Arc::new(RwLock::new(0)),
         }
     }
 }
@@ -186,7 +186,7 @@ impl DiskCache {
         let content_hash = content_hash.as_bytes().as_slice();
 
         let mut tx = self.config.db.write().begin().await?;
-        let page_count_start = page_count(&mut tx).await?;
+        let page_count_start = used_page_count(&mut tx).await?;
 
         let mut freed_pages = 0;
         // delete any other version of this file first
@@ -201,14 +201,13 @@ impl DiskCache {
         .rows_affected()
             > 0
         {
-            freed_pages = page_count(&mut tx).await? - page_count_start;
+            freed_pages = used_page_count(&mut tx).await? - page_count_start;
         }
 
-        let pages_needed = content_len.div_ceil(self.config.page_size) + 1;
-
+        let pages_needed = content_len.div_ceil(self.config.page_size) + 2;
         // this is a quick estimate
         let extra_pages_needed = {
-            let usable_pages = self.config.usable_pages_est.load(Ordering::SeqCst) + freed_pages;
+            let usable_pages = *self.config.usable_pages_est.read().await + freed_pages;
             if usable_pages >= pages_needed {
                 0
             } else {
@@ -268,22 +267,15 @@ impl DiskCache {
         .execute(tx.as_mut())
         .await?;
 
-        let page_count_end = page_count(&mut tx).await?;
+        let page_count_end = used_page_count(&mut tx).await?;
         tx.commit().await?;
 
-        let page_diff = page_count_end as i64 - page_count_start as i64;
+        let page_diff = (page_count_end as i64 - page_count_start as i64) as i32;
         if page_diff != 0 {
+            let page_diff = page_diff * -1;
             // update usable_pages estimation
-            if page_diff > 0 {
-                self.config
-                    .usable_pages_est
-                    .fetch_add(page_diff as u32, Ordering::SeqCst);
-            } else {
-                let page_diff = page_diff * -1;
-                self.config
-                    .usable_pages_est
-                    .fetch_sub((page_diff * -1) as u32, Ordering::SeqCst);
-            }
+            let mut usable_pages_est = self.config.usable_pages_est.write().await;
+            *usable_pages_est = usable_pages_est.saturating_add_signed(page_diff);
         }
 
         tracing::trace!(page_count_change = page_diff, "put");
@@ -298,11 +290,10 @@ async fn try_free_pages(
     config: &Config,
 ) -> anyhow::Result<u32> {
     let mut freed_pages = 0;
-    let mut current_page_count = page_count(tx).await?;
-
+    let mut used_page_count = used_page_count(tx).await?;
     while freed_pages < pages_to_free {
         let expiration_deadline = Utc::now() - config.ttl;
-        let page_count_before = current_page_count;
+        let page_count_before = used_page_count;
         let rows_affected = sqlx::query!(
             "
         DELETE FROM content
@@ -321,27 +312,47 @@ async fn try_free_pages(
         .execute(tx.as_mut())
         .await?
         .rows_affected();
-
         if rows_affected == 0 {
             // nothing left to delete
             break;
         }
-        current_page_count = page_count(tx).await?;
-        freed_pages += page_count_before - current_page_count;
+        used_page_count = self::used_page_count(tx).await?;
+        freed_pages += page_count_before - used_page_count;
     }
 
     tracing::debug!(pages_freed = freed_pages, "freed pages");
-
     Ok(freed_pages)
 }
 
-async fn page_count(tx: &mut Transaction<'_, Sqlite>) -> anyhow::Result<u32> {
-    sqlx::query!("PRAGMA page_count")
+async fn used_page_count(tx: &mut Transaction<'_, Sqlite>) -> anyhow::Result<u32> {
+    let page_count = sqlx::query!("PRAGMA page_count")
         .fetch_one(tx.as_mut())
         .await?
         .page_count
         .map(|c| c as u32)
-        .ok_or(anyhow!("unable to get page_count from database"))
+        .ok_or(anyhow!("unable to get page_count from database"))?;
+
+    let freelist_count = freelist_count(tx).await?;
+
+    Ok(page_count.saturating_sub(freelist_count))
+}
+
+async fn max_page_count(tx: &mut Transaction<'_, Sqlite>) -> anyhow::Result<u32> {
+    sqlx::query!("PRAGMA max_page_count")
+        .fetch_one(tx.as_mut())
+        .await?
+        .max_page_count
+        .map(|c| c as u32)
+        .ok_or(anyhow!("unable to get max_page_count from database"))
+}
+
+async fn freelist_count(tx: &mut Transaction<'_, Sqlite>) -> anyhow::Result<u32> {
+    sqlx::query!("PRAGMA freelist_count")
+        .fetch_one(tx.as_mut())
+        .await?
+        .freelist_count
+        .map(|c| c as u32)
+        .ok_or(anyhow!("unable to get freelist_count from database"))
 }
 
 async fn db_init(
@@ -373,16 +384,18 @@ async fn db_init(
             .instrument(tracing::warn_span!("db_migration"))
             .await?;
 
-        // check the page size
-
+        // check the page size & max_page_count
+        let mut tx = writer.begin().await?;
         let current_page_size = sqlx::query!("PRAGMA page_size")
-            .fetch_one(&writer)
+            .fetch_one(tx.as_mut())
             .await?
             .page_size
             .map(|c| c as u32)
             .ok_or(anyhow!("unable to get page_size from database"))?;
+        let max_page_count = max_page_count(&mut tx).await?;
+        tx.commit().await?;
 
-        if page_size == current_page_size {
+        if page_size == current_page_size && max_page_count == max_pages {
             // all good
             break writer;
         }
@@ -400,7 +413,7 @@ async fn db_init(
             );
         }
         // delete the database file and recreate it
-        tracing::info!("database at {} has wrong page_size ({} <> {}), it will be deleted and recreated with the correct page size", db_file.display(), current_page_size, page_size);
+        tracing::info!("database at {} has wrong page_size ({} <> {}) or max_page_count({} <> {}), it will be deleted and recreated with the correct page size and max_page_count", db_file.display(), current_page_size, page_size, max_page_count, max_pages);
 
         let wal_path = db_file
             .with_extension("")

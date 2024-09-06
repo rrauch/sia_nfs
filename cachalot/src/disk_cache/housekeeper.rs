@@ -1,9 +1,7 @@
-use crate::disk_cache::{page_count, try_free_pages, Config};
-use anyhow::anyhow;
+use crate::disk_cache::{freelist_count, max_page_count, try_free_pages, used_page_count, Config};
 use chrono::Utc;
 use sqlx::{Sqlite, Transaction};
 use std::cmp::min;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 
 pub(super) struct Housekeeper {
@@ -44,9 +42,9 @@ impl Housekeeper {
 
         tx.commit().await?;
 
-        config
-            .usable_pages_est
-            .store(usable_pages, Ordering::SeqCst);
+        {
+            *config.usable_pages_est.write().await = usable_pages;
+        }
 
         sqlx::query!("VACUUM").execute(config.db.write()).await?;
 
@@ -102,15 +100,11 @@ impl Housekeeper {
 
     async fn remove_expired(&self) -> anyhow::Result<bool> {
         let mut tx = self.config.db.write().begin().await?;
-        let mut up = None;
         let ret = remove_expired(&mut tx, &self.config).await?;
-        if ret {
-            up = Some(usable_pages(&mut tx, &self.config).await?);
-        }
+        let up = usable_pages(&mut tx, &self.config).await?;
+        let mut upe = self.config.usable_pages_est.write().await;
         tx.commit().await?;
-        if let Some(up) = up {
-            self.config.usable_pages_est.store(up, Ordering::SeqCst);
-        }
+        *upe = up;
         Ok(ret)
     }
 
@@ -118,8 +112,9 @@ impl Housekeeper {
         let mut tx = self.config.db.writer.begin().await?;
         let pages_freed = free_pages(&mut tx, &self.config).await?;
         let up = usable_pages(&mut tx, &self.config).await?;
+        let mut upe = self.config.usable_pages_est.write().await;
         tx.commit().await?;
-        self.config.usable_pages_est.store(up, Ordering::SeqCst);
+        *upe = up;
         Ok(pages_freed)
     }
 }
@@ -161,12 +156,11 @@ async fn remove_expired(tx: &mut Transaction<'_, Sqlite>, config: &Config) -> an
 
 async fn usable_pages(tx: &mut Transaction<'_, Sqlite>, config: &Config) -> anyhow::Result<u32> {
     let max_page_count = max_page_count(tx).await?;
-    let page_count = page_count(tx).await?;
-    let freelist_count = freelist_count(tx).await?;
+    let used_page_count = used_page_count(tx).await?;
 
-    let available_pages = max_page_count.saturating_sub(page_count);
+    let available_pages = max_page_count.saturating_sub(used_page_count);
     if available_pages == 0 {
-        return Ok(freelist_count);
+        return Ok(0);
     }
 
     let path = config.path.clone();
@@ -176,24 +170,6 @@ async fn usable_pages(tx: &mut Transaction<'_, Sqlite>, config: &Config) -> anyh
     let potential_pages =
         u32::try_from(available_disk_space / config.page_size as u64).unwrap_or(u32::MAX);
 
-    let usable = min(potential_pages + freelist_count, available_pages);
+    let usable = min(potential_pages + freelist_count(tx).await?, available_pages);
     Ok(usable)
-}
-
-async fn freelist_count(tx: &mut Transaction<'_, Sqlite>) -> anyhow::Result<u32> {
-    sqlx::query!("PRAGMA freelist_count")
-        .fetch_one(tx.as_mut())
-        .await?
-        .freelist_count
-        .map(|c| c as u32)
-        .ok_or(anyhow!("unable to get freelist_count from database"))
-}
-
-async fn max_page_count(tx: &mut Transaction<'_, Sqlite>) -> anyhow::Result<u32> {
-    sqlx::query!("PRAGMA max_page_count")
-        .fetch_one(tx.as_mut())
-        .await?
-        .max_page_count
-        .map(|c| c as u32)
-        .ok_or(anyhow!("unable to get max_page_count from database"))
 }
