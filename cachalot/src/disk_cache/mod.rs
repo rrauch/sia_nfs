@@ -129,45 +129,9 @@ impl DiskCache {
 
         let config = Config::new(db, db_file, page_size, max_pages, ttl);
 
-        let mut tx = config.db.write().begin().await?;
-
-        let db_buckets = sqlx::query!("SELECT DISTINCT bucket FROM files")
-            .fetch_all(tx.as_mut())
-            .await?
-            .into_iter()
-            .map(|r| r.bucket)
-            .collect::<Vec<_>>();
-
-        let obsolete_buckets = db_buckets
-            .into_iter()
-            .filter(|b| !buckets.contains(b))
-            .collect::<Vec<_>>();
-
-        if !obsolete_buckets.is_empty() {
-            tracing::info!("removing data for obsolete buckets");
-            for bucket in obsolete_buckets {
-                sqlx::query!("DELETE FROM files WHERE bucket = ?", bucket)
-                    .execute(tx.as_mut())
-                    .await?;
-            }
-        }
-
-        remove_expired(&mut tx, &config).await?;
-
-        free_pages(&mut tx, &config).await?;
-
-        let usable_pages = usable_pages(&mut tx, &config).await?;
-
-        tx.commit().await?;
-
-        sqlx::query!("VACUUM").execute(config.db.write()).await?;
-
-        config
-            .usable_pages_est
-            .store(usable_pages, Ordering::SeqCst);
+        let mut housekeeper = Housekeeper::new(config.clone(), &buckets).await?;
 
         let _housekeeping = {
-            let mut housekeeper = Housekeeper::new(config.clone());
             tokio::spawn(async move {
                 housekeeper.run().await;
                 tracing::info!("housekeeper stopped");
@@ -378,78 +342,6 @@ async fn page_count(tx: &mut Transaction<'_, Sqlite>) -> anyhow::Result<u32> {
         .page_count
         .map(|c| c as u32)
         .ok_or(anyhow!("unable to get page_count from database"))
-}
-
-async fn max_page_count(tx: &mut Transaction<'_, Sqlite>) -> anyhow::Result<u32> {
-    sqlx::query!("PRAGMA max_page_count")
-        .fetch_one(tx.as_mut())
-        .await?
-        .max_page_count
-        .map(|c| c as u32)
-        .ok_or(anyhow!("unable to get max_page_count from database"))
-}
-
-async fn freelist_count(tx: &mut Transaction<'_, Sqlite>) -> anyhow::Result<u32> {
-    sqlx::query!("PRAGMA freelist_count")
-        .fetch_one(tx.as_mut())
-        .await?
-        .freelist_count
-        .map(|c| c as u32)
-        .ok_or(anyhow!("unable to get freelist_count from database"))
-}
-async fn usable_pages(tx: &mut Transaction<'_, Sqlite>, config: &Config) -> anyhow::Result<u32> {
-    let max_pages_count = max_page_count(tx).await?;
-    let page_count = page_count(tx).await?;
-
-    let available_pages = max_pages_count.saturating_sub(page_count);
-    if available_pages == 0 {
-        return Ok(0);
-    }
-
-    let freelist_count = freelist_count(tx).await?;
-
-    let path = config.path.clone();
-    let available_disk_space =
-        tokio::task::spawn_blocking(move || fs4::available_space(&path)).await??;
-
-    let potential_pages =
-        u32::try_from(available_disk_space / config.page_size as u64).unwrap_or(u32::MAX);
-
-    let usable = min(potential_pages + freelist_count, available_pages);
-    Ok(usable)
-}
-
-async fn remove_expired(tx: &mut Transaction<'_, Sqlite>, config: &Config) -> anyhow::Result<bool> {
-    let deadline = Utc::now() - config.ttl;
-
-    let did_work = sqlx::query!("DELETE FROM content WHERE created <= ?", deadline)
-        .execute(tx.as_mut())
-        .await?
-        .rows_affected()
-        > 0;
-
-    Ok(did_work)
-}
-async fn free_pages(tx: &mut Transaction<'_, Sqlite>, config: &Config) -> anyhow::Result<()> {
-    let extra_pages_needed = {
-        let usable_pages = usable_pages(tx, config).await?;
-        if usable_pages >= config.min_free_pages {
-            0
-        } else {
-            config.min_free_pages - usable_pages
-        }
-    };
-
-    if extra_pages_needed > 0 {
-        tracing::info!(
-            extra_pages_needed = extra_pages_needed,
-            "freeing pages from disk cache"
-        );
-        let pages_freed = try_free_pages(extra_pages_needed, tx, config).await?;
-        tracing::info!(pages_freed = pages_freed, "pages freed");
-    }
-
-    Ok(())
 }
 
 async fn db_init(
