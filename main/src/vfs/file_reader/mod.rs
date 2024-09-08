@@ -16,6 +16,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::task::JoinHandle;
 
 pub(crate) struct FileReaderManager {
     scheduler: Arc<Scheduler<RenterdDownload>>,
@@ -72,6 +73,7 @@ pub struct FileReader {
     chunk_size: usize,
     current_data: Option<(u64, Cursor<Bytes>)>,
     pending: Option<(u64, BoxFuture<'static, anyhow::Result<Bytes>>)>,
+    warmup: Option<(u64, JoinHandle<anyhow::Result<Bytes>>)>,
     _read_lock: ReadLock,
 }
 
@@ -96,6 +98,7 @@ impl FileReader {
             chunk_size,
             current_data: None,
             pending: None,
+            warmup: None,
             _read_lock: read_lock,
         })
     }
@@ -114,13 +117,29 @@ impl FileReader {
         }
 
         if self.pending.is_none() {
-            let fut = get_bytes(
-                self.scheduler.clone(),
-                self.cachalot.clone(),
-                self.access_key.clone(),
-                required_chunk,
-            )
-            .boxed();
+            // first, check warmup
+            let fut = self
+                .warmup
+                .take()
+                .and_then(|(chunk, handle)| {
+                    if chunk == required_chunk {
+                        Some(async move { Ok(handle.await??) }.boxed())
+                    } else {
+                        handle.abort();
+                        None
+                    }
+                })
+                .unwrap_or_else(|| {
+                    // start a new future
+                    get_bytes(
+                        self.scheduler.clone(),
+                        self.cachalot.clone(),
+                        self.access_key.clone(),
+                        required_chunk,
+                    )
+                    .boxed()
+                });
+
             self.pending = Some((required_chunk, fut));
         }
 
@@ -143,6 +162,31 @@ impl FileReader {
         cursor.set_position(relative_offset as u64);
         self.current_data = Some((required_chunk, cursor));
         Poll::Ready(Ok(()))
+    }
+
+    fn warmup_next_chunk(mut self: Pin<&mut Self>, current_chunk: u64) {
+        let num_chunks = self.size.div_ceil(self.chunk_size as u64);
+        if current_chunk < num_chunks - 1 { // not the last chunk yet
+            let next_chunk = current_chunk + 1;
+            if let Some((pending_warmup_chunk, handle)) = &self.warmup {
+                if *pending_warmup_chunk != next_chunk {
+                    handle.abort();
+                    self.warmup.take();
+                }
+            }
+
+            if self.warmup.is_none() {
+                self.warmup = Some((
+                    next_chunk,
+                    tokio::spawn(get_bytes(
+                        self.scheduler.clone(),
+                        self.cachalot.clone(),
+                        self.access_key.clone(),
+                        next_chunk,
+                    )),
+                ))
+            }
+        }
     }
 
     pub fn eof(&self) -> bool {
@@ -236,8 +280,8 @@ impl AsyncRead for FileReader {
                 .prepare_data(cx, required_chunk, relative_offset))?;
         }
 
-        let cursor = match self.current_data.as_mut() {
-            Some((_, cursor)) if cursor.has_remaining() => cursor,
+        let (current_chunk, cursor) = match self.current_data.as_mut() {
+            Some((current_chunk, cursor)) if cursor.has_remaining() => (*current_chunk, cursor),
             _ => {
                 return Poll::Ready(Err(std::io::Error::from(ErrorKind::UnexpectedEof)));
             }
@@ -246,6 +290,8 @@ impl AsyncRead for FileReader {
         let num_bytes = min(buf.len(), cursor.remaining());
         cursor.copy_to_slice(&mut buf[..num_bytes]);
         self.offset += num_bytes as u64;
+        self.warmup_next_chunk(current_chunk);
+
         Poll::Ready(Ok(num_bytes))
     }
 }
