@@ -79,13 +79,21 @@ struct Config {
     db: SqlitePool,
     path: PathBuf,
     page_size: u32,
+    chunk_size: u32,
     min_free_pages: u32,
     ttl: Duration,
     usable_pages_est: Arc<RwLock<u32>>,
 }
 
 impl Config {
-    fn new(db: SqlitePool, path: &Path, page_size: u32, max_pages: u32, ttl: Duration) -> Self {
+    fn new(
+        db: SqlitePool,
+        path: &Path,
+        page_size: u32,
+        chunk_size: u32,
+        max_pages: u32,
+        ttl: Duration,
+    ) -> Self {
         // 10% of max size, but between 1MiB and 1GiB
         let one_mib_pages = (1024u32 * 1024).div_ceil(page_size);
         let one_gib_pages = (1024u32 * 1024 * 1024).div_ceil(page_size);
@@ -96,6 +104,7 @@ impl Config {
             db,
             path: path.to_path_buf(),
             page_size,
+            chunk_size,
             min_free_pages,
             ttl,
             usable_pages_est: Arc::new(RwLock::new(0)),
@@ -118,16 +127,21 @@ impl DiskCache {
     pub(super) async fn new(
         db_file: &Path,
         page_size: u32,
+        chunk_size: u32,
         max_size: u64,
         max_db_connections: u8,
         ttl: Duration,
         buckets: Vec<String>,
     ) -> anyhow::Result<Self> {
+        if chunk_size > (page_size - 128) {
+            tracing::warn!(page_size = page_size, chunk_size = chunk_size, "for optimal performance chunk_size should be smaller than page_size by at least 128 byte");
+        }
+
         let max_pages = u32::try_from(max_size.div_ceil(page_size as u64)).unwrap_or(u32::MAX);
 
         let db = db_init(db_file, page_size, max_pages, max_db_connections, true).await?;
 
-        let config = Config::new(db, db_file, page_size, max_pages, ttl);
+        let config = Config::new(db, db_file, page_size, chunk_size, max_pages, ttl);
 
         let mut housekeeper = Housekeeper::new(config.clone(), &buckets).await?;
 
@@ -149,21 +163,21 @@ impl DiskCache {
         bucket: &str,
         path: &str,
         version: u64,
-        page: u64,
+        chunk: u64,
     ) -> anyhow::Result<Option<Bytes>> {
-        let page = page as i64;
+        let chunk = chunk as i64;
         let version = version as i64;
         Ok(sqlx::query!(
             "
         SELECT c.content
         FROM files f
-        JOIN pages p ON f.id = p.file_id
-        JOIN content c ON p.content_hash = c.content_hash
-        WHERE f.bucket = ? AND f.path = ? AND f.version = ? AND p.page_nr = ?",
+        JOIN chunks k ON f.id = k.file_id
+        JOIN content c ON k.content_hash = c.content_hash
+        WHERE f.bucket = ? AND f.path = ? AND f.version = ? AND k.chunk_nr = ?",
             bucket,
             path,
             version,
-            page,
+            chunk,
         )
         .fetch_optional(self.config.db.read())
         .await?
@@ -175,10 +189,10 @@ impl DiskCache {
         bucket: &str,
         path: &str,
         version: u64,
-        page: u64,
+        chunk: u64,
         content: Bytes,
     ) -> anyhow::Result<()> {
-        let page = page as i64;
+        let chunk = chunk as i64;
         let version = version as i64;
         let content = content.as_ref();
         let content_len = content.len() as u32;
@@ -252,16 +266,16 @@ impl DiskCache {
 
         sqlx::query!(
             "
-            INSERT INTO pages (file_id, page_nr, content_hash)
+            INSERT INTO chunks (file_id, chunk_nr, content_hash)
             VALUES (
                 (SELECT id FROM files WHERE bucket = ? AND path = ? AND version = ?),
                 ?, ?
             )
-            ON CONFLICT (file_id, page_nr) DO UPDATE SET content_hash = excluded.content_hash;",
+            ON CONFLICT (file_id, chunk_nr) DO UPDATE SET content_hash = excluded.content_hash;",
             bucket,
             path,
             version,
-            page,
+            chunk,
             content_hash,
         )
         .execute(tx.as_mut())
@@ -304,7 +318,7 @@ async fn try_free_pages(
                 (created < ?) DESC,
                 created ASC,
                 last_referenced ASC,
-                num_pages ASC
+                num_chunks ASC
             LIMIT 1
         )",
             expiration_deadline

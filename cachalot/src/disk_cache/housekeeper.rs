@@ -13,6 +13,24 @@ impl Housekeeper {
     pub async fn new(config: Config, buckets: &Vec<String>) -> anyhow::Result<Self> {
         let mut tx = config.db.write().begin().await?;
 
+        let chunk_size = sqlx::query!("SELECT chunk_size FROM config")
+            .fetch_one(tx.as_mut())
+            .await?
+            .chunk_size as u32;
+        if chunk_size != config.chunk_size {
+            tracing::info!(
+                previous_chunk_size = chunk_size,
+                current_chunk_size = config.chunk_size,
+                "chunk size has changed, evicting all cached content"
+            );
+            sqlx::query!("DELETE FROM content")
+                .execute(tx.as_mut())
+                .await?;
+            sqlx::query!("UPDATE config set chunk_size = ?", config.chunk_size)
+                .execute(tx.as_mut())
+                .await?;
+        }
+
         let db_buckets = sqlx::query!("SELECT DISTINCT bucket FROM files")
             .fetch_all(tx.as_mut())
             .await?
@@ -26,7 +44,7 @@ impl Housekeeper {
             .collect::<Vec<_>>();
 
         if !obsolete_buckets.is_empty() {
-            tracing::info!("removing data for obsolete buckets");
+            tracing::info!("evicting cached content for obsolete buckets");
             for bucket in obsolete_buckets {
                 sqlx::query!("DELETE FROM files WHERE bucket = ?", bucket)
                     .execute(tx.as_mut())

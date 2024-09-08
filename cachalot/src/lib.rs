@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-const VALID_PAGE_SIZES: [u32; 8] = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536];
+const VALID_CHUNK_SIZES: [u32; 5] = [4096, 8192, 16384, 32768, 65536];
 const CONTENT_HASH_SEED: [u8; 32] = [
     0xf9, 0xa2, 0x9a, 0xe8, 0xe1, 0xe3, 0x26, 0x91, 0x57, 0xab, 0x79, 0x15, 0x92, 0xc9, 0x6f, 0x2e,
     0x92, 0xef, 0xfd, 0x66, 0x59, 0x85, 0xc0, 0xd3, 0x32, 0xc7, 0x13, 0x35, 0xb4, 0x71, 0x29, 0x14,
@@ -21,23 +21,23 @@ const CONTENT_HASH_SEED: [u8; 32] = [
 pub struct Cachalot {
     mem_cache: Cache<(String, String, u64, u64), Bytes>,
     disk_cache: Option<DiskCache>,
-    page_size: usize,
+    chunk_size: usize,
 }
 
-pub struct PageSize(u32);
-impl TryFrom<u32> for PageSize {
+pub struct ChunkSize(u32);
+impl TryFrom<u32> for ChunkSize {
     type Error = u32;
     fn try_from(value: u32) -> Result<Self, Self::Error> {
-        if !VALID_PAGE_SIZES.contains(&value) {
+        if !VALID_CHUNK_SIZES.contains(&value) {
             return Err(value);
         }
-        Ok(PageSize(value))
+        Ok(ChunkSize(value))
     }
 }
 
 pub struct CachalotBuilder {
     buckets: Vec<String>,
-    page_size: u32,
+    chunk_size: u32,
     max_mem_cache: u64,
     ttl: Duration,
     tti: Duration,
@@ -54,10 +54,10 @@ impl CachalotBuilder {
         )
     }
 
-    pub fn page_size<P: TryInto<PageSize>>(mut self, page_size: P) -> anyhow::Result<Self> {
-        self.page_size = page_size
+    pub fn chunk_size<P: TryInto<ChunkSize>>(mut self, chunk_size: P) -> anyhow::Result<Self> {
+        self.chunk_size = chunk_size
             .try_into()
-            .map_err(|_| anyhow!("page_size invalid"))?
+            .map_err(|_| anyhow!("chunk_size invalid"))?
             .0;
         Ok(self)
     }
@@ -83,9 +83,9 @@ impl CachalotBuilder {
         Ok(self)
     }
 
-    pub async fn build(self) -> anyhow::Result<Cachalot> {
-        if self.max_mem_cache < self.page_size as u64 {
-            bail!("max_mem_cache cannot be smaller than page size");
+    pub async fn build(mut self) -> anyhow::Result<Cachalot> {
+        if self.max_mem_cache < self.chunk_size as u64 {
+            bail!("max_mem_cache cannot be smaller than chunk_size");
         }
 
         let mem_cache = CacheBuilder::new(self.max_mem_cache)
@@ -95,14 +95,19 @@ impl CachalotBuilder {
             .build();
 
         let disk_cache = if let Some((path, max_size, ttl, max_connections)) = self.disk_cache {
-            if max_size < self.page_size as u64 {
-                bail!("max_disk_cache cannot be smaller than page size");
+            if max_size < self.chunk_size as u64 {
+                bail!("max_disk_cache cannot be smaller than chunk_size");
             }
+
+            let page_size = self.chunk_size;
+            // reduce chunk_size to fit row into single database page
+            self.chunk_size -= 128;
 
             Some(
                 DiskCache::new(
                     path.as_path(),
-                    self.page_size,
+                    page_size,
+                    self.chunk_size,
                     max_size,
                     max_connections,
                     ttl,
@@ -117,7 +122,7 @@ impl CachalotBuilder {
         Ok(Cachalot {
             mem_cache,
             disk_cache,
-            page_size: self.page_size as usize,
+            chunk_size: self.chunk_size as usize,
         })
     }
 }
@@ -133,7 +138,7 @@ impl Cachalot {
                 .into_iter()
                 .map(|s| s.as_ref().to_string())
                 .collect(),
-            page_size: PageSize::try_from(32768).unwrap().0,
+            chunk_size: ChunkSize::try_from(32768).unwrap().0,
             max_mem_cache: 1024 * 1024 * 100,
             ttl: Duration::from_secs(86400 * 7),
             tti: Duration::from_secs(86400 * 7),
@@ -141,8 +146,8 @@ impl Cachalot {
         }
     }
 
-    pub fn page_size(&self) -> usize {
-        self.page_size
+    pub fn chunk_size(&self) -> usize {
+        self.chunk_size
     }
 
     pub async fn try_get_with<F>(
@@ -150,7 +155,7 @@ impl Cachalot {
         bucket: &str,
         path: &str,
         version: u64,
-        page: u64,
+        chunk: u64,
         init: F,
     ) -> anyhow::Result<Bytes>
     where
@@ -159,10 +164,10 @@ impl Cachalot {
         Ok(self
             .mem_cache
             .try_get_with::<_, anyhow::Error>(
-                (bucket.to_string(), path.to_string(), version, page),
+                (bucket.to_string(), path.to_string(), version, chunk),
                 async {
                     if let Some(disk_cache) = self.disk_cache.as_ref() {
-                        if let Some(content) = disk_cache.get(bucket, path, version, page).await? {
+                        if let Some(content) = disk_cache.get(bucket, path, version, chunk).await? {
                             return Ok(content);
                         }
                     }
@@ -171,7 +176,7 @@ impl Cachalot {
 
                     if let Some(disk_cache) = self.disk_cache.as_ref() {
                         disk_cache
-                            .put(bucket, path, version, page, content.clone())
+                            .put(bucket, path, version, chunk, content.clone())
                             .await?;
                     }
 

@@ -69,7 +69,7 @@ pub struct FileReader {
     access_key: <RenterdDownload as ResourceManager>::AccessKey,
     offset: u64,
     size: u64,
-    page_size: usize,
+    chunk_size: usize,
     current_data: Option<(u64, Cursor<Bytes>)>,
     pending: Option<(u64, BoxFuture<'static, anyhow::Result<Bytes>>)>,
     _read_lock: ReadLock,
@@ -86,14 +86,14 @@ impl FileReader {
     ) -> anyhow::Result<Self> {
         let prepare_key = (bucket, path);
         let access_key = scheduler.prepare(&prepare_key).await?;
-        let page_size = cachalot.page_size();
+        let chunk_size = cachalot.chunk_size();
         Ok(Self {
             scheduler,
             access_key,
             cachalot,
             offset: 0,
             size,
-            page_size,
+            chunk_size,
             current_data: None,
             pending: None,
             _read_lock: read_lock,
@@ -103,11 +103,11 @@ impl FileReader {
     fn prepare_data(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        required_page: u64,
+        required_chunk: u64,
         relative_offset: usize,
     ) -> Poll<std::io::Result<()>> {
-        if let Some((page, _)) = self.pending.as_ref() {
-            if *page != required_page {
+        if let Some((chunk, _)) = self.pending.as_ref() {
+            if *chunk != required_chunk {
                 // drop this pending future
                 self.pending.take();
             }
@@ -118,10 +118,10 @@ impl FileReader {
                 self.scheduler.clone(),
                 self.cachalot.clone(),
                 self.access_key.clone(),
-                required_page,
+                required_chunk,
             )
             .boxed();
-            self.pending = Some((required_page, fut));
+            self.pending = Some((required_chunk, fut));
         }
 
         let (_, fut) = self.pending.as_mut().unwrap();
@@ -141,7 +141,7 @@ impl FileReader {
         }
 
         cursor.set_position(relative_offset as u64);
-        self.current_data = Some((required_page, cursor));
+        self.current_data = Some((required_chunk, cursor));
         Poll::Ready(Ok(()))
     }
 
@@ -158,19 +158,19 @@ async fn get_bytes(
     scheduler: Arc<Scheduler<RenterdDownload>>,
     cachalot: Arc<Cachalot>,
     access_key: <RenterdDownload as ResourceManager>::AccessKey,
-    page: u64,
+    chunk: u64,
 ) -> anyhow::Result<Bytes> {
     let (bucket, path, version) = &access_key;
-    let page_size = cachalot.page_size();
-    let offset = page_size as u64 * page;
+    let chunk_size = cachalot.chunk_size();
+    let offset = chunk_size as u64 * chunk;
 
     Ok(cachalot
         .try_get_with(
             bucket,
             path,
             version.as_u64(),
-            page,
-            get_from_renterd(scheduler, access_key.clone(), offset, page_size),
+            chunk,
+            get_from_renterd(scheduler, access_key.clone(), offset, chunk_size),
         )
         .await?)
 }
@@ -202,11 +202,11 @@ async fn get_from_renterd(
     Ok(Bytes::from(buffer))
 }
 
-fn calculate_page_and_offset(offset: u64, page_size: usize) -> (u64, usize) {
-    let page_size = page_size as u64;
-    let page_nr = offset / page_size;
-    let relative_offset = (offset % page_size) as usize;
-    (page_nr, relative_offset)
+fn calculate_chunk_and_offset(offset: u64, chunk_size: usize) -> (u64, usize) {
+    let chunk_size = chunk_size as u64;
+    let chunk_nr = offset / chunk_size;
+    let relative_offset = (offset % chunk_size) as usize;
+    (chunk_nr, relative_offset)
 }
 
 impl AsyncRead for FileReader {
@@ -228,12 +228,12 @@ impl AsyncRead for FileReader {
         }
 
         if self.current_data.is_none() {
-            let (required_page, relative_offset) =
-                calculate_page_and_offset(self.offset, self.page_size);
+            let (required_chunk, relative_offset) =
+                calculate_chunk_and_offset(self.offset, self.chunk_size);
 
             ready!(self
                 .as_mut()
-                .prepare_data(cx, required_page, relative_offset))?;
+                .prepare_data(cx, required_chunk, relative_offset))?;
         }
 
         let cursor = match self.current_data.as_mut() {
@@ -266,9 +266,9 @@ impl AsyncSeek for FileReader {
             return Poll::Ready(Err(std::io::Error::from(ErrorKind::InvalidInput)));
         }
 
-        let (required_page, relative_offset) = calculate_page_and_offset(offset, self.page_size);
-        if let Some((current_page, cursor)) = self.current_data.as_mut() {
-            if current_page == &required_page {
+        let (required_chunk, relative_offset) = calculate_chunk_and_offset(offset, self.chunk_size);
+        if let Some((current_chunk, cursor)) = self.current_data.as_mut() {
+            if current_chunk == &required_chunk {
                 let size = cursor.get_ref().len();
                 if relative_offset > size {
                     return Poll::Ready(Err(std::io::Error::from(ErrorKind::InvalidInput)));
@@ -282,7 +282,7 @@ impl AsyncSeek for FileReader {
         self.current_data.take();
         ready!(self
             .as_mut()
-            .prepare_data(cx, required_page, relative_offset))?;
+            .prepare_data(cx, required_chunk, relative_offset))?;
         self.offset = offset;
         Poll::Ready(Ok(offset))
     }
