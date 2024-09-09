@@ -13,10 +13,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const VALID_CHUNK_SIZES: [u32; 5] = [4096, 8192, 16384, 32768, 65536];
-const CONTENT_HASH_SEED: [u8; 32] = [
-    0xf9, 0xa2, 0x9a, 0xe8, 0xe1, 0xe3, 0x26, 0x91, 0x57, 0xab, 0x79, 0x15, 0x92, 0xc9, 0x6f, 0x2e,
-    0x92, 0xef, 0xfd, 0x66, 0x59, 0x85, 0xc0, 0xd3, 0x32, 0xc7, 0x13, 0x35, 0xb4, 0x71, 0x29, 0x14,
-];
 
 pub struct Cachalot {
     mem_cache: Cache<(String, String, u64, u64), Bytes>,
@@ -189,7 +185,7 @@ impl Cachalot {
 }
 
 pub(crate) fn content_hash(content: &[u8]) -> Hash {
-    let mut hasher = blake3::Hasher::new_keyed(&CONTENT_HASH_SEED);
+    let mut hasher = blake3::Hasher::new();
     hasher.update("cachalot content hash v1 start\n".as_bytes());
     hasher.update("length:".as_bytes());
     hasher.update(content.len().to_le_bytes().as_slice());
