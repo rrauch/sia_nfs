@@ -1,6 +1,7 @@
 mod renterd_download;
 
-use crate::io_scheduler::{ResourceManager, Scheduler};
+use crate::io_scheduler::resource_manager::ResourceManager;
+use crate::io_scheduler::Scheduler;
 use crate::vfs::file_reader::renterd_download::RenterdDownload;
 use crate::vfs::locking::ReadLock;
 use bytes::{Buf, Bytes};
@@ -11,7 +12,7 @@ use renterd_client::Client;
 use std::cmp::min;
 use std::future::Future;
 use std::io::{Cursor, ErrorKind, SeekFrom};
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::pin::{pin, Pin};
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -26,22 +27,27 @@ pub(crate) struct FileReaderManager {
 impl FileReaderManager {
     pub fn new(
         renterd: Client,
-        max_concurrent_downloads: NonZeroUsize,
         cachalot: Cachalot,
+        max_concurrent_downloads: NonZeroUsize,
+        max_skip_ahead: NonZeroU64,
     ) -> anyhow::Result<Self> {
+        let cachalot = Arc::new(cachalot);
         let scheduler = RenterdDownload::new(
             renterd,
+            cachalot.clone(),
+            max_skip_ahead,
             max_concurrent_downloads,
-            Duration::from_secs(1),
-            Duration::from_millis(600),
-            NonZeroUsize::new(5).unwrap(),
-            Duration::from_millis(1000),
-            Duration::from_millis(250),
+            Duration::from_millis(2000),
+            Duration::from_millis(50),
+            Duration::from_millis(150),
+            Duration::from_millis(1500),
+            Duration::from_millis(10),
+            Duration::from_millis(200),
         );
 
         Ok(Self {
             scheduler: Arc::new(scheduler),
-            cachalot: Arc::new(cachalot),
+            cachalot,
         })
     }
 

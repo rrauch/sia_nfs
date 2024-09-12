@@ -1,8 +1,13 @@
-use crate::io_scheduler::{Action, QueueState, Resource, ResourceManager, Scheduler};
+use crate::io_scheduler::resource_manager::Action::Sleep;
+use crate::io_scheduler::resource_manager::{
+    Action, Context, QueueCtrl, Resource, ResourceManager,
+};
+use crate::io_scheduler::Scheduler;
 use crate::vfs::file_writer::FileWriter;
 use crate::vfs::inode::Inode;
 use crate::vfs::Vfs;
 use anyhow::bail;
+use futures_util::future::BoxFuture;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,7 +17,13 @@ pub(crate) struct Upload {
 
 impl Upload {
     pub(crate) fn new(vfs: Arc<Vfs>, max_idle: Duration) -> Scheduler<Self> {
-        Scheduler::new(Upload { vfs }, false, max_idle, max_idle, 0)
+        Scheduler::new(
+            Upload { vfs },
+            false,
+            max_idle + Duration::from_millis(10),
+            max_idle,
+            0,
+        )
     }
 }
 
@@ -21,17 +32,12 @@ impl ResourceManager for Upload {
     type PreparationKey = (u64, String);
     type AccessKey = u64;
     type ResourceData = ();
-    type AdviseData = ();
+    type ResourceFuture = BoxFuture<'static, anyhow::Result<Self::Resource>>; // nonexistent, actually
 
     async fn prepare(
         &self,
         preparation_key: &Self::PreparationKey,
-    ) -> anyhow::Result<(
-        Self::AccessKey,
-        Self::ResourceData,
-        Self::AdviseData,
-        Vec<Self::Resource>,
-    )> {
+    ) -> anyhow::Result<(Self::AccessKey, Self::ResourceData, Vec<Self::Resource>)> {
         let (parent_id, name) = preparation_key;
         let parent = match self.vfs.inode_by_id(*parent_id).await? {
             Some(Inode::Directory(dir)) => dir,
@@ -52,24 +58,29 @@ impl ResourceManager for Upload {
             "upload prepared"
         );
 
-        Ok((file.id(), (), (), vec![fw]))
+        Ok((file.id(), (), vec![fw]))
     }
 
-    async fn new_resource(
+    fn process(
         &self,
-        _offset: u64,
-        _data: &Self::ResourceData,
-    ) -> anyhow::Result<Self::Resource> {
-        bail!("upload queues cannot start new resources")
-    }
+        queue: &mut QueueCtrl<Self>,
+        _: &mut Self::ResourceData,
+        _: &Context,
+    ) -> anyhow::Result<Action> {
+        let active_count = queue
+            .entries()
+            .iter()
+            .filter(|e| e.as_idle().is_some() || e.as_active().is_some())
+            .count();
 
-    fn advise<'a>(
-        &self,
-        _state: &'a QueueState,
-        _data: &mut Self::AdviseData,
-    ) -> anyhow::Result<(Duration, Option<Action<'a>>)> {
-        let next_consultation = Duration::from_secs(10);
-        Ok((next_consultation, None))
+        if active_count != 1 {
+            bail!(
+                "expected active_count to be 1 but found {}, aborting",
+                active_count
+            );
+        };
+
+        Ok(Sleep(Duration::from_secs(5)))
     }
 }
 

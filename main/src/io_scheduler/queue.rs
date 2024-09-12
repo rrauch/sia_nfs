@@ -1,8 +1,10 @@
-use super::{Action, QueueState, Resource, ResourceManager};
+use super::ResourceManager;
+use crate::io_scheduler::queue::ctrl::QueueCtrl;
+use crate::io_scheduler::resource_manager::{Action, Context, Resource};
 use anyhow::{bail, Result};
 use futures_util::future::BoxFuture;
 use itertools::Itertools;
-use std::cmp::min;
+use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::future;
 use std::sync::Arc;
@@ -121,7 +123,6 @@ impl<RM: ResourceManager + Send + Sync + 'static> Queue<RM> {
     pub(super) fn new(
         resource_manager: Arc<RM>,
         resource_data: RM::ResourceData,
-        advise_data: RM::AdviseData,
         initial_resources: Vec<RM::Resource>,
         max_idle: Duration,
         max_resource_idle: Duration,
@@ -132,10 +133,7 @@ impl<RM: ResourceManager + Send + Sync + 'static> Queue<RM> {
         let (return_tx, return_rx) = mpsc::channel(10);
         let ct = CancellationToken::new();
         let runner = {
-            let mut queue = QueueImpl::new(
-                resource_manager,
-                resource_data,
-                advise_data,
+            let queue = QueueInner::new(
                 initial_resources,
                 ct.clone(),
                 return_tx,
@@ -147,7 +145,15 @@ impl<RM: ResourceManager + Send + Sync + 'static> Queue<RM> {
                 Box::new(f) as Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send + 'static>
             });
             tokio::spawn(async move {
-                queue.run(resource_rx, return_rx, term_fn).await;
+                Self::run(
+                    queue,
+                    resource_manager,
+                    resource_data,
+                    resource_rx,
+                    return_rx,
+                    term_fn,
+                )
+                .await;
             })
         };
 
@@ -172,15 +178,193 @@ impl<RM: ResourceManager + Send + Sync + 'static> Queue<RM> {
         self.ct.cancel();
         let _ = self.runner.await;
     }
+
+    async fn run(
+        mut queue: QueueInner<RM>,
+        rm: Arc<RM>,
+        mut resource_data: RM::ResourceData,
+        mut resource_rx: mpsc::Receiver<(u64, Response<RM::Resource>)>,
+        mut return_rx: mpsc::Receiver<(usize, RM::Resource)>,
+        mut term_fn: Option<Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send>>,
+    ) {
+        let mut prepare_resources: JoinSet<(usize, Result<<RM as ResourceManager>::Resource>)> =
+            JoinSet::new();
+        // add a dummy entry that never resolves
+        prepare_resources.spawn(async move {
+            // wait forever
+            future::pending::<()>().await;
+            unreachable!()
+        });
+        let mut finalize_resources: JoinSet<()> = JoinSet::new();
+
+        let mut ctx = Context {
+            started: queue.started,
+            last_activity: SystemTime::now(),
+            previous_call: None,
+            iteration: 0,
+        };
+
+        loop {
+            // cleanup
+            for resource in queue.cleanup() {
+                finalize_resources.spawn(async move {
+                    let _ = resource.finalize().await;
+                });
+            }
+
+            // match waiting & idle first
+            if queue.match_waiting() > 0 {
+                ctx.last_activity = SystemTime::now();
+            }
+
+            let mut next_processing = SystemTime::now() + Duration::from_secs(86400);
+
+            if queue.wait_count() > 0 {
+                // work needs to be done here
+                let mut break_loop = false;
+                let mut ctrl = QueueCtrl::new(&mut queue);
+                let call_start = SystemTime::now();
+                match rm.process(&mut ctrl, &mut resource_data, &ctx) {
+                    Ok(Action::Sleep(duration)) => {
+                        let duration = max(duration, Duration::from_millis(1)); // make sure sleep duration is at least 1 ms
+                        tracing::trace!(
+                            duration_ms = duration.as_millis(),
+                            "next scheduled resource manager call"
+                        );
+                        next_processing = SystemTime::now() + duration;
+                    }
+                    Ok(Action::Shutdown) => {
+                        tracing::debug!("resource manager requested immediate queue shutdown");
+                        break_loop = true;
+                    }
+                    Ok(Action::Again) => {
+                        tracing::trace!("resource manager will be called again");
+                        next_processing = SystemTime::now();
+                    }
+                    Err(err) => {
+                        tracing::error!(error = %err, "error getting resource_manager advise, shutting down queue");
+                        break_loop = true;
+                    }
+                }
+                ctx.iteration += 1;
+                ctx.previous_call = Some(call_start);
+
+                if !ctrl.futures.is_empty() || !ctrl.finalize_resources.is_empty() {
+                    ctx.last_activity = SystemTime::now();
+                }
+
+                for (id, fut) in ctrl.futures {
+                    prepare_resources.spawn(async move { (id, fut.await) });
+                }
+                for resource in ctrl.finalize_resources {
+                    finalize_resources.spawn(async move {
+                        let _ = resource.finalize().await;
+                    });
+                }
+
+                if break_loop {
+                    break;
+                }
+            }
+
+            let now = SystemTime::now();
+
+            let next_processing_in = next_processing.duration_since(now).unwrap_or_default();
+
+            let resource_inactivity_timeout_in = queue
+                .next_idle_resource_expiration()
+                .map_or(Duration::from_secs(86400 * 365), |exp| {
+                    exp.duration_since(now).unwrap_or_default()
+                });
+
+            let next_run_in = min(resource_inactivity_timeout_in, next_processing_in);
+
+            let inactivity_timeout_in = if queue.is_idle() {
+                (ctx.last_activity + queue.max_idle)
+                    .duration_since(now)
+                    .unwrap_or_default()
+            } else {
+                Duration::from_secs(86400 * 365)
+            };
+
+            tokio::select! {
+                Some((offset, resp)) = resource_rx.recv() => {
+                    queue.wait(offset, resp);
+                    ctx.last_activity = SystemTime::now();
+                },
+                Some((id, resource)) = return_rx.recv() => {
+                    queue.return_resource(id, resource);
+                    ctx.last_activity = SystemTime::now();
+                }
+                Some(res) = prepare_resources.join_next() => {
+                    match res {
+                        Ok((id, Ok(resource))) => {
+                            if let Err(err) = queue.redeem(id, Some(resource)).await {
+                                tracing::error!(error = %err, "unable to redeem resource");
+                            }
+                        }
+                        Ok((id, Err(err))) => {
+                            queue.prep_errors_left = queue.prep_errors_left.saturating_sub(1);
+                            if queue.prep_errors_left == 0 {
+                                tracing::error!("too many preparation errors, shutting down queue");
+                                break;
+                            }
+                            let _ = queue.redeem(id, None);
+                            tracing::error!(error = %err, "preparing resource failed");
+                        }
+                        Err(err) => {
+                            tracing::error!(error = %err, "unable to prepare resource, shutting down queue");
+                            break;
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(next_run_in) => {
+                    // run the loop now
+                }
+                _ = tokio::time::sleep(inactivity_timeout_in) => {
+                    // inactivity timeout reached
+                    // exit loop
+                    break;
+                }
+                _ = queue.ct.cancelled() => {
+                    // shutdown requested
+                    // exit loop
+                    break;
+                }
+            }
+        }
+        // make sure the channels are closed first
+        drop(resource_rx);
+        drop(return_rx);
+
+        // finalize idle resources
+        for (_, v) in queue.map.drain() {
+            if let Op::Idle(resource) = v.op {
+                finalize_resources.spawn(async move {
+                    let _ = resource.finalize().await;
+                });
+            }
+        }
+
+        // execute termination function if set
+        if let Some(term_fn) = term_fn.take() {
+            term_fn().await;
+        }
+
+        // cleanup
+        prepare_resources.abort_all();
+
+        // wait for all tasks to end
+        while let Some(_) = prepare_resources.join_next().await {}
+        while let Some(_) = finalize_resources.join_next().await {}
+    }
 }
 
-struct QueueImpl<RM: ResourceManager + Send + Sync + 'static>
+struct QueueInner<RM: ResourceManager + Send + Sync + 'static>
 where
     <RM as ResourceManager>::Resource: 'static,
 {
-    resource_manager: Arc<RM>,
-    resource_data: Arc<RM::ResourceData>,
-    advise_data: RM::AdviseData,
+    started: SystemTime,
     ct: CancellationToken,
     return_tx: mpsc::Sender<(usize, RM::Resource)>,
     max_idle: Duration,
@@ -190,11 +374,8 @@ where
     prep_errors_left: usize,
 }
 
-impl<RM: ResourceManager + Send + Sync + 'static> QueueImpl<RM> {
+impl<RM: ResourceManager + Send + Sync + 'static> QueueInner<RM> {
     fn new(
-        resource_manager: Arc<RM>,
-        resource_data: RM::ResourceData,
-        advise_data: RM::AdviseData,
         initial_resources: Vec<RM::Resource>,
         ct: CancellationToken,
         return_tx: mpsc::Sender<(usize, RM::Resource)>,
@@ -218,9 +399,7 @@ impl<RM: ResourceManager + Send + Sync + 'static> QueueImpl<RM> {
         }
 
         Self {
-            resource_manager,
-            resource_data: Arc::new(resource_data),
-            advise_data,
+            started: SystemTime::now(),
             ct,
             return_tx,
             max_idle,
@@ -310,33 +489,6 @@ impl<RM: ResourceManager + Send + Sync + 'static> QueueImpl<RM> {
         }
         self.idle(resource);
         bail!("redeem failed");
-    }
-
-    fn stats(&self) -> QueueState {
-        let mut idle = vec![];
-        let mut waiting = vec![];
-        let mut active = vec![];
-        let mut preparing = vec![];
-
-        for (k, v) in self.map.iter() {
-            match v.op {
-                Op::Waiting(_) => waiting.push(super::Waiting {
-                    id: *k,
-                    offset: v.offset,
-                    since: v.since,
-                }),
-                Op::Active => active.push(super::Active { offset: v.offset }),
-                Op::Idle(_) => idle.push(super::Idle {
-                    id: *k,
-                    since: v.since,
-                    offset: v.offset,
-                }),
-                Op::Reserved(_, _) => preparing.push(super::Preparing { offset: v.offset }),
-                Op::Invalid => {}
-            }
-        }
-
-        QueueState::new(idle, waiting, active, preparing)
     }
 
     fn wait_count(&self) -> usize {
@@ -494,168 +646,6 @@ impl<RM: ResourceManager + Send + Sync + 'static> QueueImpl<RM> {
             })
             .min()
     }
-
-    async fn run(
-        &mut self,
-        mut resource_rx: mpsc::Receiver<(u64, Response<RM::Resource>)>,
-        mut return_rx: mpsc::Receiver<(usize, RM::Resource)>,
-        mut term_fn: Option<Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send>>,
-    ) {
-        let mut last_activity = SystemTime::now();
-        let mut prepare_resources = JoinSet::new();
-        // add a dummy entry that never resolves
-        prepare_resources.spawn(async move {
-            // wait forever
-            future::pending::<()>().await;
-            unreachable!()
-        });
-        let mut finalize_resources: JoinSet<()> = JoinSet::new();
-
-        loop {
-            // cleanup
-            for resource in self.cleanup() {
-                finalize_resources.spawn(async move {
-                    let _ = resource.finalize().await;
-                });
-            }
-
-            // match waiting & idle first
-            if self.match_waiting() > 0 {
-                last_activity = SystemTime::now();
-            }
-
-            let mut next_advise = SystemTime::now() + Duration::from_secs(86400);
-            if self.wait_count() > 0 {
-                // work needs to be done here
-                let stats = self.stats();
-                let (next_advise_reply, action) = match self
-                    .resource_manager
-                    .advise(&stats, &mut self.advise_data)
-                {
-                    Ok((next_advise, action)) => (SystemTime::now() + next_advise, action),
-                    Err(err) => {
-                        tracing::error!(error = %err, "error getting resource_manager advise, shutting down queue");
-                        break;
-                    }
-                };
-                next_advise = next_advise_reply;
-                if let Some(action) = action {
-                    match action {
-                        Action::Free(idle) => {
-                            if let Some(resource) = self.free_idle(idle.id) {
-                                finalize_resources.spawn(async move {
-                                    let _ = resource.finalize().await;
-                                });
-                            }
-                        }
-                        Action::NewResource(waiting) => {
-                            let id = waiting.id;
-                            let offset = waiting.offset;
-                            let backend = self.resource_manager.clone();
-                            let data = self.resource_data.clone();
-                            if let Ok(()) = self.reserve(id) {
-                                prepare_resources.spawn(async move {
-                                    (id, backend.new_resource(offset, &data).await)
-                                });
-                            } else {
-                                tracing::error!("error reserving queue slot for {}", id);
-                            }
-                        }
-                    }
-                }
-            }
-
-            let now = SystemTime::now();
-
-            let next_advise_in = next_advise.duration_since(now).unwrap_or_default();
-
-            let resource_inactivity_timeout_in = self
-                .next_idle_resource_expiration()
-                .map_or(Duration::from_secs(86400 * 365), |exp| {
-                    exp.duration_since(now).unwrap_or_default()
-                });
-
-            let next_run_in = min(resource_inactivity_timeout_in, next_advise_in);
-
-            let inactivity_timeout_in = if self.is_idle() {
-                (last_activity + self.max_idle)
-                    .duration_since(now)
-                    .unwrap_or_default()
-            } else {
-                Duration::from_secs(86400 * 365)
-            };
-
-            tokio::select! {
-                Some((offset, resp)) = resource_rx.recv() => {
-                    self.wait(offset, resp);
-                    last_activity = SystemTime::now();
-                },
-                Some((id, resource)) = return_rx.recv() => {
-                    self.return_resource(id, resource);
-                    last_activity = SystemTime::now();
-                }
-                Some(res) = prepare_resources.join_next() => {
-                    match res {
-                        Ok((id, Ok(resource))) => {
-                            if let Err(err) = self.redeem(id, Some(resource)).await {
-                                tracing::error!(error = %err, "unable to redeem resource");
-                            }
-                        }
-                        Ok((id, Err(err))) => {
-                            self.prep_errors_left -= 1;
-                            if self.prep_errors_left == 0 {
-                                tracing::error!("too many preparation errors, shutting down queue");
-                                break;
-                            }
-                            let _ = self.redeem(id, None);
-                            tracing::error!(error = %err, "preparing resource failed");
-                        }
-                        Err(err) => {
-                            tracing::error!(error = %err, "unable to prepare resource, shutting down queue");
-                            break;
-                        }
-                    }
-                }
-                _ = tokio::time::sleep(next_run_in) => {
-                    // run the loop now
-                }
-                _ = tokio::time::sleep(inactivity_timeout_in) => {
-                    // inactivity timeout reached
-                    // exit loop
-                    break;
-                }
-                _ = self.ct.cancelled() => {
-                    // shutdown requested
-                    // exit loop
-                    break;
-                }
-            }
-        }
-        // make sure the channels are closed first
-        drop(resource_rx);
-        drop(return_rx);
-
-        // finalize idle resources
-        for (_, v) in self.map.drain() {
-            if let Op::Idle(resource) = v.op {
-                finalize_resources.spawn(async move {
-                    let _ = resource.finalize().await;
-                });
-            }
-        }
-
-        // execute termination function if set
-        if let Some(term_fn) = term_fn.take() {
-            term_fn().await;
-        }
-
-        // cleanup
-        prepare_resources.abort_all();
-
-        // wait for all tasks to end
-        while let Some(_) = prepare_resources.join_next().await {}
-        while let Some(_) = finalize_resources.join_next().await {}
-    }
 }
 
 pub(crate) struct ActiveHandle<R: Resource + 'static> {
@@ -687,5 +677,112 @@ impl<R: Resource + 'static> Drop for ActiveHandle<R> {
                 }
             });
         }
+    }
+}
+
+pub(super) mod ctrl {
+    use crate::io_scheduler::queue::{Op, QueueInner};
+    use crate::io_scheduler::resource_manager::Entry;
+    use crate::io_scheduler::ResourceManager;
+    use anyhow::{bail, Result};
+    use std::time::SystemTime;
+
+    pub(crate) struct QueueCtrl<'a, RM: ResourceManager + Send + Sync + 'static> {
+        inner: &'a mut QueueInner<RM>,
+        pub(super) futures: Vec<(usize, RM::ResourceFuture)>,
+        pub(super) finalize_resources: Vec<RM::Resource>,
+    }
+
+    impl<'a, RM: ResourceManager + Send + Sync + 'static> QueueCtrl<'a, RM> {
+        pub(super) fn new(inner: &'a mut QueueInner<RM>) -> Self {
+            Self {
+                inner,
+                futures: vec![],
+                finalize_resources: vec![],
+            }
+        }
+
+        pub fn entries(&self) -> Vec<Entry> {
+            let mut entries: Vec<Entry> = vec![];
+
+            for (k, v) in self.inner.map.iter() {
+                match v.op {
+                    Op::Waiting(_) => entries.push(
+                        Waiting {
+                            id: *k,
+                            offset: v.offset,
+                            since: v.since,
+                        }
+                        .into(),
+                    ),
+                    Op::Active => entries.push(
+                        Active {
+                            offset: v.offset,
+                            since: v.since,
+                        }
+                        .into(),
+                    ),
+                    Op::Idle(_) => entries.push(
+                        Idle {
+                            id: *k,
+                            since: v.since,
+                            offset: v.offset,
+                        }
+                        .into(),
+                    ),
+                    Op::Reserved(_, _) => entries.push(
+                        Active {
+                            offset: v.offset,
+                            since: v.since,
+                        }
+                        .into(),
+                    ),
+                    Op::Invalid => {}
+                }
+            }
+
+            entries.sort_unstable_by(|a, b| a.offset().cmp(&b.offset()));
+
+            entries
+        }
+
+        pub fn prepare(&mut self, waiting: &Waiting, fut: RM::ResourceFuture) -> Result<()> {
+            self.inner.reserve(waiting.id)?;
+            self.futures.push((waiting.id, fut));
+            Ok(())
+        }
+
+        pub fn take_idle(&mut self, idle: &Idle) -> Option<RM::Resource> {
+            self.inner.free_idle(idle.id)
+        }
+
+        pub fn finalize(&mut self, idle: &Idle) -> Result<()> {
+            if let Some(res) = self.take_idle(idle) {
+                self.finalize_resources.push(res);
+                Ok(())
+            } else {
+                bail!("unable to finalize idle resource, take_idle failed");
+            }
+        }
+    }
+
+    #[derive(Clone, PartialEq, Eq)]
+    pub struct Idle {
+        id: usize,
+        pub offset: u64,
+        pub since: SystemTime,
+    }
+
+    #[derive(Clone, PartialEq, Eq)]
+    pub struct Waiting {
+        id: usize,
+        pub offset: u64,
+        pub since: SystemTime,
+    }
+
+    #[derive(Clone, PartialEq, Eq)]
+    pub struct Active {
+        pub offset: u64,
+        pub since: SystemTime,
     }
 }

@@ -1,20 +1,18 @@
 use crate::io_scheduler::queue::{ActiveHandle, Queue};
+use crate::io_scheduler::resource_manager::ResourceManager;
 use anyhow::{anyhow, bail, Result};
 use bimap::BiHashMap;
 use futures_util::FutureExt;
 use parking_lot::RwLock;
-use std::collections::{BTreeMap, HashMap};
-use std::fmt::Debug;
-use std::future::Future;
-use std::hash::Hash;
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 use tracing::instrument;
 
 pub(crate) mod queue;
-pub(crate) mod strategy;
+pub(crate) mod resource_manager;
 
 pub(crate) struct Scheduler<RM: ResourceManager>
 where
@@ -140,7 +138,7 @@ impl<RM: ResourceManager + 'static + Send + Sync> Scheduler<RM> {
                 let mut state = self.state.write();
                 notify.notify_waiters();
                 return match res {
-                    Ok((access_key, resource_data, advise_data, initial_resources)) => {
+                    Ok((access_key, resource_data, initial_resources)) => {
                         let term_fn = {
                             let preparation_key = preparation_key.clone();
                             let term_tx = self.term_tx.clone();
@@ -157,7 +155,6 @@ impl<RM: ResourceManager + 'static + Send + Sync> Scheduler<RM> {
                         let queue = Queue::new(
                             self.resource_manager.clone(),
                             resource_data,
-                            advise_data,
                             initial_resources,
                             self.max_queue_idle,
                             self.max_resource_idle,
@@ -220,129 +217,4 @@ where
 {
     Preparing(Arc<Notify>),
     Ready(Arc<Queue<RM>>),
-}
-
-pub(crate) trait ResourceManager: Sized {
-    type Resource: Resource;
-    type PreparationKey: Hash + Eq + Clone + Send + 'static + Sync + Debug;
-    type AccessKey: Hash + Eq + Clone + Send + 'static + Sync + Debug;
-    type ResourceData: Send + Sync + 'static;
-    type AdviseData: Send + Sync + 'static;
-
-    fn prepare(
-        &self,
-        preparation_key: &Self::PreparationKey,
-    ) -> impl Future<
-        Output = Result<(
-            Self::AccessKey,
-            Self::ResourceData,
-            Self::AdviseData,
-            Vec<Self::Resource>,
-        )>,
-    > + Send;
-
-    fn new_resource(
-        &self,
-        offset: u64,
-        data: &Self::ResourceData,
-    ) -> impl Future<Output = Result<Self::Resource>> + Send;
-
-    fn advise<'a>(
-        &self,
-        state: &'a QueueState,
-        data: &mut Self::AdviseData,
-    ) -> Result<(Duration, Option<Action<'a>>)>;
-}
-
-pub(crate) trait Resource: Send {
-    fn offset(&self) -> u64;
-    fn can_reuse(&self) -> bool;
-    fn finalize(self) -> impl Future<Output = Result<()>> + Send;
-}
-
-pub(crate) enum Action<'a> {
-    Free(&'a Idle),
-    NewResource(&'a Waiting),
-}
-
-pub(crate) struct QueueState {
-    pub idle: Entries<Idle>,
-    pub waiting: Entries<Waiting>,
-    pub active: Entries<Active>,
-    pub preparing: Entries<Preparing>,
-}
-
-impl QueueState {
-    fn new(
-        idle: Vec<Idle>,
-        waiting: Vec<Waiting>,
-        active: Vec<Active>,
-        preparing: Vec<Preparing>,
-    ) -> Self {
-        Self {
-            idle: idle.into_iter().map(|e| (e.offset, e)).collect(),
-            waiting: waiting.into_iter().map(|e| (e.offset, e)).collect(),
-            active: active.into_iter().map(|e| (e.offset, e)).collect(),
-            preparing: preparing.into_iter().map(|e| (e.offset, e)).collect(),
-        }
-    }
-}
-
-pub(crate) struct Entries<T> {
-    len: usize,
-    map: BTreeMap<u64, Vec<T>>,
-}
-
-impl<T> FromIterator<(u64, T)> for Entries<T> {
-    fn from_iter<I: IntoIterator<Item = (u64, T)>>(iter: I) -> Self {
-        let mut map: BTreeMap<u64, Vec<T>> = BTreeMap::new();
-        let mut len = 0;
-        iter.into_iter().for_each(|(offset, v)| {
-            map.entry(offset).or_default().push(v);
-            len += 1;
-        });
-        Self { len, map }
-    }
-}
-
-impl<T> Entries<T> {
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = &T> {
-        self.map.values().flat_map(|t| t.iter())
-    }
-
-    pub fn get_before_offset(&self, offset: u64) -> impl Iterator<Item = &T> {
-        self.map.range(..offset).flat_map(|(_, v)| v.iter())
-    }
-
-    pub fn get_at_or_after_offset(&self, offset: u64) -> impl Iterator<Item = &T> {
-        self.map.range(offset..).flat_map(|(_, v)| v.iter())
-    }
-}
-
-pub(crate) struct Idle {
-    id: usize,
-    pub offset: u64,
-    pub since: SystemTime,
-}
-
-pub(crate) struct Waiting {
-    id: usize,
-    pub offset: u64,
-    pub since: SystemTime,
-}
-
-pub(crate) struct Active {
-    pub offset: u64,
-}
-
-pub(crate) struct Preparing {
-    pub offset: u64,
 }

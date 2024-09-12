@@ -9,7 +9,7 @@ use cachalot::Cachalot;
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{ConnectOptions, Pool, Sqlite};
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,9 +50,10 @@ impl SiaNfs {
             Vfs::new(
                 renterd,
                 db,
-                &buckets,
-                NonZeroUsize::new(25).unwrap(),
                 cachalot,
+                &buckets,
+                NonZeroUsize::new(5).unwrap(),
+                NonZeroU64::new(1024 * 1024 * 1).unwrap(),
             )
             .await?,
         );

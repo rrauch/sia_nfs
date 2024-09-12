@@ -22,7 +22,7 @@ use parking_lot::RwLock;
 use renterd_client::bus::object::{Metadata, RenameMode};
 use renterd_client::Client as RenterdClient;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -45,9 +45,10 @@ impl Vfs {
     pub(super) async fn new(
         renterd: RenterdClient,
         db: SqlitePool,
-        buckets: &Vec<String>,
-        max_concurrent_downloads: NonZeroUsize,
         cachalot: Cachalot,
+        buckets: &Vec<String>,
+        max_concurrent_downloads_per_file: NonZeroUsize,
+        max_skip_ahead: NonZeroU64,
     ) -> Result<Self> {
         // get all available buckets from renterd
         let available_buckets = renterd
@@ -81,8 +82,12 @@ impl Vfs {
             })?;
 
         let inode_manager = InodeManager::new(db, ROOT_ID, buckets).await?;
-        let file_reader_manager =
-            FileReaderManager::new(renterd.clone(), max_concurrent_downloads, cachalot)?;
+        let file_reader_manager = FileReaderManager::new(
+            renterd.clone(),
+            cachalot,
+            max_concurrent_downloads_per_file,
+            max_skip_ahead,
+        )?;
 
         Ok(Self {
             renterd,

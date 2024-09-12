@@ -51,7 +51,7 @@ impl NFSFileSystem for SiaNfsFs {
         Ok(to_fattr3(&self.inode_by_id(id).await?))
     }
 
-    async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
+    async fn setattr(&self, id: fileid3, _setattr: sattr3) -> Result<fattr3, nfsstat3> {
         tracing::debug!("setattr called");
         Ok(to_fattr3(&self.inode_by_id(id).await?))
     }
@@ -100,8 +100,6 @@ impl NFSFileSystem for SiaNfsFs {
             tracing::error!(error = %e, "read error");
             NFS3ERR_IO
         })?;
-
-        let eof = file_reader.eof();
 
         Ok((buf, file_reader.eof()))
     }
@@ -283,15 +281,15 @@ impl NFSFileSystem for SiaNfsFs {
 
     async fn symlink(
         &self,
-        dirid: fileid3,
-        linkname: &filename3,
-        symlink: &nfspath3,
-        attr: &sattr3,
+        _dirid: fileid3,
+        _linkname: &filename3,
+        _symlink: &nfspath3,
+        _attr: &sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
         Err(NFS3ERR_NOTSUPP)
     }
 
-    async fn readlink(&self, id: fileid3) -> Result<nfspath3, nfsstat3> {
+    async fn readlink(&self, _id: fileid3) -> Result<nfspath3, nfsstat3> {
         Err(NFS3ERR_NOTSUPP)
     }
 }
