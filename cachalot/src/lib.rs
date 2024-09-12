@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-const VALID_CHUNK_SIZES: [u32; 5] = [4096, 8192, 16384, 32768, 65536];
+const VALID_CHUNK_SIZES: [u32; 4] = [8192, 16384, 32768, 65536];
 
 pub struct Cachalot {
     mem_cache: Cache<(String, String, u64, u64), Bytes>,
