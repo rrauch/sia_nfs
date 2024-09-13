@@ -29,6 +29,10 @@ impl SiaNfs {
         disk_cache: Option<(&Path, u64)>,
         buckets: Vec<String>,
         listen_address: &str,
+        uid: u32,
+        gid: u32,
+        file_mode: u32,
+        dir_mode: u32,
     ) -> Result<Self> {
         let renterd = renterd_client::ClientBuilder::new()
             .api_endpoint_url(renterd_endpoint)
@@ -65,7 +69,7 @@ impl SiaNfs {
         Ok(Self {
             listener: NFSTcpListener::bind(
                 listen_address,
-                SiaNfsFs::new(vfs, Duration::from_secs(5)),
+                SiaNfsFs::new(vfs, Duration::from_secs(5), uid, gid, file_mode, dir_mode),
             )
             .await?,
         })

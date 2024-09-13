@@ -23,12 +23,30 @@ use tracing::instrument;
 pub(crate) struct SiaNfsFs {
     vfs: Arc<Vfs>,
     uploader: Scheduler<Upload>,
+    uid: u32,
+    gid: u32,
+    file_mode: u32,
+    dir_mode: u32,
 }
 
 impl SiaNfsFs {
-    pub(super) fn new(vfs: Arc<Vfs>, upload_max_idle: Duration) -> Self {
+    pub(super) fn new(
+        vfs: Arc<Vfs>,
+        upload_max_idle: Duration,
+        uid: u32,
+        gid: u32,
+        file_mode: u32,
+        dir_mode: u32,
+    ) -> Self {
         let uploader = Upload::new(vfs.clone(), upload_max_idle);
-        Self { uploader, vfs }
+        Self {
+            uploader,
+            vfs,
+            uid,
+            gid,
+            file_mode,
+            dir_mode,
+        }
     }
 }
 
@@ -48,12 +66,12 @@ impl NFSFileSystem for SiaNfsFs {
     }
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
-        Ok(to_fattr3(&self.inode_by_id(id).await?))
+        Ok(self.to_fattr3(&self.inode_by_id(id).await?))
     }
 
     async fn setattr(&self, id: fileid3, _setattr: sattr3) -> Result<fattr3, nfsstat3> {
         tracing::debug!("setattr called");
-        Ok(to_fattr3(&self.inode_by_id(id).await?))
+        Ok(self.to_fattr3(&self.inode_by_id(id).await?))
     }
 
     #[instrument(skip(self))]
@@ -128,7 +146,7 @@ impl NFSFileSystem for SiaNfsFs {
 
         tracing::debug!(file = ?file, offset = offset, data = data.len(), "write complete");
 
-        Ok(to_fattr3(&Inode::File(upload.to_file())))
+        Ok(self.to_fattr3(&Inode::File(upload.to_file())))
     }
 
     async fn create(
@@ -142,7 +160,7 @@ impl NFSFileSystem for SiaNfsFs {
         if inode.inode_type() != InodeType::File {
             return Err(NFS3ERR_ISDIR);
         }
-        Ok((id, to_fattr3(&inode)))
+        Ok((id, self.to_fattr3(&inode)))
     }
 
     #[instrument(skip(self))]
@@ -186,7 +204,7 @@ impl NFSFileSystem for SiaNfsFs {
             .await
             .map_err(|_| NFS3ERR_SERVERFAULT)?;
 
-        Ok((dir.id(), to_fattr3(&Inode::Directory(dir))))
+        Ok((dir.id(), self.to_fattr3(&Inode::Directory(dir))))
     }
 
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
@@ -266,7 +284,7 @@ impl NFSFileSystem for SiaNfsFs {
             ret.entries.push(DirEntry {
                 fileid: inode.id(),
                 name: inode.name().as_bytes().into(),
-                attr: to_fattr3(inode),
+                attr: self.to_fattr3(inode),
             });
             if ret.entries.len() >= max_entries {
                 break;
@@ -325,35 +343,35 @@ impl SiaNfsFs {
             None => Err(NFS3ERR_NOENT),
         }
     }
-}
 
-fn to_fattr3(inode: &Inode) -> fattr3 {
-    let size = match inode {
-        Inode::Directory(_) => 0,
-        Inode::File(file) => file.size(),
-    };
-    let last_modified = to_nfsstime(inode.last_modified());
+    fn to_fattr3(&self, inode: &Inode) -> fattr3 {
+        let size = match inode {
+            Inode::Directory(_) => 0,
+            Inode::File(file) => file.size(),
+        };
+        let last_modified = to_nfsstime(inode.last_modified());
 
-    fattr3 {
-        ftype: match inode {
-            Inode::Directory(_) => ftype3::NF3DIR,
-            Inode::File(_) => ftype3::NF3REG,
-        },
-        mode: match inode {
-            Inode::Directory(_) => 0o700,
-            Inode::File(_) => 0o600,
-        },
-        nlink: 1,
-        uid: 1000,
-        gid: 1000,
-        size,
-        used: size,
-        rdev: specdata3::default(),
-        fsid: 0,
-        fileid: inode.id(),
-        atime: last_modified,
-        mtime: last_modified,
-        ctime: last_modified,
+        fattr3 {
+            ftype: match inode {
+                Inode::Directory(_) => ftype3::NF3DIR,
+                Inode::File(_) => ftype3::NF3REG,
+            },
+            mode: match inode {
+                Inode::Directory(_) => self.dir_mode,
+                Inode::File(_) => self.file_mode,
+            },
+            nlink: 1,
+            uid: self.uid,
+            gid: self.gid,
+            size,
+            used: size,
+            rdev: specdata3::default(),
+            fsid: 0,
+            fileid: inode.id(),
+            atime: last_modified,
+            mtime: last_modified,
+            ctime: last_modified,
+        }
     }
 }
 

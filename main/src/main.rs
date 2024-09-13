@@ -1,6 +1,7 @@
 use bytesize::ByteSize;
 use clap::Parser;
 use sia_nfs::SiaNfs;
+use std::num::ParseIntError;
 use std::path::PathBuf;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{Instrument, Level};
@@ -35,6 +36,24 @@ struct Arguments {
     /// List of buckets to export.
     #[arg(required = true, num_args = 1..)]
     buckets: Vec<String>,
+    /// UID of files and directories
+    #[arg(long, env = "INODE_UID")]
+    #[clap(default_value = "1000")]
+    uid: u32,
+    /// GID of files and directories
+    #[arg(long, env = "INODE_GID")]
+    #[clap(default_value = "1000")]
+    gid: u32,
+    /// Unix file permissions.
+    #[arg(long, env)]
+    #[clap(default_value = "0600")]
+    #[clap(value_parser = parse_octal)]
+    file_mode: u32,
+    /// Unix directory permissions.
+    #[arg(long, env)]
+    #[clap(default_value = "0700")]
+    #[clap(value_parser = parse_octal)]
+    dir_mode: u32,
 }
 
 #[tokio::main]
@@ -71,6 +90,10 @@ async fn main() -> anyhow::Result<()> {
             .map(|(path, size)| (path.as_path(), *size)),
         arguments.buckets,
         &arguments.listen_address,
+        arguments.uid,
+        arguments.gid,
+        arguments.file_mode,
+        arguments.dir_mode,
     )
     .await?;
 
@@ -102,4 +125,8 @@ async fn main() -> anyhow::Result<()> {
     }
     .instrument(span)
     .await
+}
+
+fn parse_octal(src: &str) -> Result<u32, ParseIntError> {
+    u32::from_str_radix(src, 8)
 }
