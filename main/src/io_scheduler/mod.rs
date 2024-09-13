@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 use tracing::instrument;
 
-pub(crate) mod queue;
+mod queue;
 pub(crate) mod resource_manager;
 
 pub(crate) struct Scheduler<RM: ResourceManager>

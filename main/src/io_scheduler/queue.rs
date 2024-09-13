@@ -233,16 +233,12 @@ impl<RM: ResourceManager + Send + Sync + 'static> Queue<RM> {
                         );
                         next_processing = SystemTime::now() + duration;
                     }
-                    Ok(Action::Shutdown) => {
-                        tracing::debug!("resource manager requested immediate queue shutdown");
-                        break_loop = true;
-                    }
                     Ok(Action::Again) => {
                         tracing::trace!("resource manager will be called again");
                         next_processing = SystemTime::now();
                     }
                     Err(err) => {
-                        tracing::error!(error = %err, "error getting resource_manager advise, shutting down queue");
+                        tracing::error!(error = %err, "resource_manager returned error, shutting down queue");
                         break_loop = true;
                     }
                 }

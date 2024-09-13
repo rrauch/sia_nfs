@@ -41,7 +41,6 @@ pub(crate) struct Context {
 pub(crate) enum Action {
     Again,
     Sleep(Duration),
-    Shutdown,
 }
 
 #[derive(Clone)]
