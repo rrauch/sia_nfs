@@ -26,8 +26,7 @@ impl SiaNfs {
         renterd_endpoint: &Url,
         renterd_password: &str,
         db_path: &Path,
-        cache_db_path: &Path,
-        disk_cache_size: u64,
+        disk_cache: Option<(&Path, u64)>,
         buckets: Vec<String>,
         listen_address: &str,
     ) -> Result<Self> {
@@ -37,12 +36,17 @@ impl SiaNfs {
             .verbose_logging(true)
             .build()?;
 
-        let cachalot = Cachalot::builder(&buckets)
-            .with_disk_cache(cache_db_path)
-            .max_size(disk_cache_size)?
-            .build()
-            .build()
-            .await?;
+        let mut cachalot_builder = Cachalot::builder(&buckets);
+        if let Some((cache_db_path, max_size)) = disk_cache {
+            cachalot_builder = cachalot_builder
+                .with_disk_cache(cache_db_path)
+                .max_size(max_size)?
+                .max_connections(20)?
+                .build();
+        } else {
+            tracing::info!("Note: disk cache is currently DISABLED");
+        };
+        let cachalot = cachalot_builder.build().await?;
 
         let db = db_init(db_path, 20, true).await?;
 

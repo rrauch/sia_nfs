@@ -1,3 +1,4 @@
+use bytesize::ByteSize;
 use clap::Parser;
 use sia_nfs::SiaNfs;
 use std::path::PathBuf;
@@ -11,18 +12,22 @@ use url::Url;
 /// Exports Sia buckets via NFS.
 /// Connects to renterd, allowing direct NFS access to exported buckets.
 struct Arguments {
-    #[arg(long, short = 'e', env)]
+    #[arg(long, short = 'e', env, value_hint = clap::ValueHint::Url)]
     /// URL for renterd's API endpoint (e.g., http://localhost:9880/api/).
     renterd_api_endpoint: Url,
     /// Password for the renterd API. It's recommended to use an environment variable for this.
     #[arg(long, short = 's', env)]
     renterd_api_password: String,
-    /// Directory path to store persistent data. Will be created if it doesn't exist.
-    #[arg(long, short = 'p', env)]
-    data_path: PathBuf,
-    /// Directory path to store the content cache. Will be created if it doesn't exist.
+    /// Directory to store persistent data in. Will be created if it doesn't exist.
+    #[arg(long, short = 'd', env, value_hint = clap::ValueHint::DirPath)]
+    data_dir: PathBuf,
+    /// Optional directory to store the content cache in. Defaults to `DATA_DIR` if not set. Will be created if it doesn't exist.
     #[arg(long, short = 'c', env)]
-    cache_path: PathBuf,
+    cache_dir: Option<PathBuf>,
+    /// Maximum size of content cache. Set to `0` to disable.
+    #[arg(long, short = 'm', env)]
+    #[clap(default_value = "2 GiB")]
+    max_cache_size: ByteSize,
     /// Host and port to listen on.
     #[arg(long, short = 'l', env)]
     #[clap(default_value = "localhost:12000")]
@@ -45,18 +50,25 @@ async fn main() -> anyhow::Result<()> {
 
     let arguments = Arguments::parse();
 
-    tokio::fs::create_dir_all(&arguments.data_path).await?;
-    let db_path = arguments.data_path.join("sia_nfs.sqlite");
+    tokio::fs::create_dir_all(&arguments.data_dir).await?;
+    let db_path = arguments.data_dir.join("sia_nfs.sqlite");
 
-    tokio::fs::create_dir_all(&arguments.cache_path).await?;
-    let cache_db_path = arguments.cache_path.join("sia_cache.sqlite");
+    let disk_cache = if arguments.max_cache_size.as_u64() > 0 {
+        let cache_dir = arguments.cache_dir.unwrap_or_else(|| arguments.data_dir);
+        tokio::fs::create_dir_all(&cache_dir).await?;
+        let cache_db_path = cache_dir.join("sia_nfs_cache.sqlite");
+        Some((cache_db_path, arguments.max_cache_size.as_u64()))
+    } else {
+        None
+    };
 
     let sia_nfs = SiaNfs::new(
         &arguments.renterd_api_endpoint,
         &arguments.renterd_api_password,
         &db_path,
-        &cache_db_path,
-        1024 * 1024 * 1024 * 2,
+        disk_cache
+            .as_ref()
+            .map(|(path, size)| (path.as_path(), *size)),
         arguments.buckets,
         &arguments.listen_address,
     )
