@@ -1,550 +1,445 @@
+use crate::vfs::ROOT_ID;
 use crate::SqlitePool;
-use anyhow::anyhow;
+use anyhow::bail;
 use anyhow::Result;
-use bimap::BiHashMap;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use futures::Stream;
 use futures_util::TryStreamExt;
 use itertools::Itertools;
-use sqlx::FromRow;
-use std::collections::{BTreeMap, HashMap};
-use std::fmt::{Display, Formatter};
-use std::str::FromStr;
+use renterd_client::bus::object::Metadata;
+use sqlx::{FromRow, Sqlite, SqliteExecutor, Transaction};
+use std::collections::{HashMap, HashSet};
+use std::fmt::Debug;
+use std::mem::discriminant;
 use std::sync::Arc;
+use synonym::Synonym;
 
-pub(super) struct InodeManager {
-    db: SqlitePool,
-    bucket_ids: BiHashMap<u64, String>,
-    buckets: BTreeMap<u64, Directory>,
-}
+const ROOT_INODE_ID: InodeId = InodeId(ROOT_ID);
+const MIN_BUCKET_ID: InodeId = InodeId(100);
+const MIN_OBJECT_ID: InodeId = InodeId(10_000);
 
-impl InodeManager {
-    pub async fn new(
-        db: SqlitePool,
-        root_id: u64,
-        buckets: BTreeMap<String, Directory>,
-    ) -> Result<Self> {
-        let root_id = root_id as i64;
-        // get the highest known bucket id
-        let mut bucket_id = {
-            sqlx::query!(
-                // sqlx seems unable to determine the type of MAX(id) without the explicit CAST statement
-                "SELECT CAST(MAX(id) AS Integer) AS max_id FROM fs_entries WHERE parent = ?",
-                root_id,
-            )
-            .fetch_one(db.read())
-            .await?
-            .max_id
-            .map(|x| x as u64)
-            .unwrap_or(0)
-            .max(100)
-        };
-        bucket_id += 1;
+#[derive(Synonym)]
+pub struct InodeId(u64);
 
-        // housekeeping
-        let mut tx = db.write().begin().await?;
-        let _ = sqlx::query!(
-            "DELETE FROM fs_entries WHERE id != ? AND parent = ? AND entry_type != 'D'",
-            root_id,
-            root_id
-        )
-        .execute(tx.as_mut())
-        .await?;
+#[derive(Synonym)]
+pub struct ObjectId(u64);
 
-        let known_buckets: Vec<String> = sqlx::query!(
-            "SELECT DISTINCT(name) as name FROM fs_entries WHERE parent = ? AND id != ?",
-            root_id,
-            root_id,
-        )
-        .fetch_all(tx.as_mut())
-        .await?
-        .into_iter()
-        .map(|r| r.name)
-        .collect();
-
-        // delete obsolete buckets
-        for bucket in &known_buckets {
-            if !buckets.contains_key(bucket) {
-                let _ = sqlx::query!(
-                    "DELETE FROM fs_entries WHERE name = ? AND parent = ?",
-                    bucket,
-                    root_id
-                )
-                .execute(tx.as_mut())
-                .await?;
-            }
-        }
-
-        // create missing buckets
-        for bucket in buckets.keys() {
-            if !known_buckets.contains(bucket) {
-                let id = bucket_id as i64;
-                let _ = sqlx::query!(
-                    "INSERT INTO fs_entries (id, parent, name, entry_type) VALUES (?, ?, ?, 'D')",
-                    id,
-                    root_id,
-                    bucket
-                )
-                .execute(tx.as_mut())
-                .await?;
-                bucket_id += 1;
-            }
-        }
-        tx.commit().await?;
-
-        // map ids to buckets
-        let bucket_ids: BiHashMap<u64, String> = sqlx::query!(
-            "SELECT id, name FROM fs_entries WHERE parent = ? and id != ? ORDER BY id ASC",
-            root_id,
-            root_id
-        )
-        .fetch_all(db.read())
-        .await?
-        .into_iter()
-        .map(|r| (r.id as u64, r.name))
-        .collect();
-
-        let buckets = buckets
-            .into_iter()
-            .map(|(name, mut dir)| {
-                let id = bucket_ids
-                    .get_by_right(&name)
-                    .expect("bucket is unexplainably missing")
-                    .clone();
-                dir.set_id(id);
-                (id, dir)
-            })
-            .collect::<BTreeMap<_, _>>();
-
-        Ok(Self {
-            db,
-            buckets,
-            bucket_ids,
-        })
-    }
-
-    pub fn bucket_by_id(&self, id: u64) -> Option<&Directory> {
-        self.buckets.get(&id)
-    }
-
-    pub fn bucket_by_name(&self, name: &str) -> Option<&Directory> {
-        self.bucket_ids
-            .get_by_right(name)
-            .map(|id| self.buckets.get(id))
-            .flatten()
-    }
-
-    pub fn buckets(&self) -> impl Iterator<Item = &Directory> {
-        self.buckets.values()
-    }
-
-    pub async fn sync_by_name_parent(
-        &self,
-        name: &str,
-        parent_id: u64,
-        inode_type: InodeType,
-        size: u64,
-        last_modified: DateTime<Utc>,
-    ) -> Result<Inode> {
-        let id = if let Some(inode) = {
-            let parent_id = parent_id as i64;
-            let name = name.to_string();
-            sqlx::query_as!(
-                InodeRecord,
-                "SELECT id, name, parent, entry_type FROM fs_entries WHERE parent = ? AND name = ?",
-                parent_id,
-                name
-            )
-            .fetch_optional(self.db.read())
-            .await?
-            .map(|r| Inode::try_from(r))
-            .transpose()?
-        } {
-            if inode.inode_type() != inode_type {
-                // the entry type has changed, delete
-                let parent_id = parent_id as i64;
-                let id = inode.id() as i64;
-                sqlx::query!(
-                    "DELETE FROM fs_entries WHERE id = ? and parent = ?",
-                    id,
-                    parent_id
-                )
-                .execute(self.db.write())
-                .await?;
-                None
-            } else {
-                Some(inode.id())
-            }
-        } else {
-            None
-        };
-
-        let id = match id {
-            Some(id) => id,
-            None => {
-                let inode_type = inode_type.as_ref();
-                let parent_id = parent_id as i64;
-                sqlx::query!(
-                    "INSERT INTO fs_entries (name, parent, entry_type) VALUES (?, ?, ?)",
-                    name,
-                    parent_id,
-                    inode_type,
-                )
-                .execute(self.db.write())
-                .await?
-                .last_insert_rowid() as u64
-            }
-        };
-
-        Ok(Inode::new(
-            id,
-            name.to_string(),
-            size,
-            last_modified,
-            parent_id,
-            inode_type,
-        ))
-    }
-
-    pub async fn inode_by_id(&self, id: u64) -> Result<Option<Inode>> {
-        let db_id = id as i64;
-        sqlx::query_as!(
-            InodeRecord,
-            "SELECT id, parent, entry_type, name FROM fs_entries WHERE id = ?",
-            db_id
-        )
-        .fetch_optional(self.db.read())
-        .await?
-        .map(|i| Inode::try_from(i))
-        .transpose()
-    }
-
-    pub async fn sync_dir(
-        &self,
-        dir_id: u64,
-        mut inodes: impl Stream<Item = Result<Vec<Inode>>> + Unpin,
-    ) -> Result<(Vec<Inode>, Vec<u64>)> {
-        let parent = dir_id as i64;
-        let mut obsolete: HashMap<_, _> = sqlx::query_as!(
-            InodeRecord,
-            "SELECT id, name, parent, entry_type FROM fs_entries WHERE parent = ?",
-            parent
-        )
-        .fetch_all(self.db.read())
-        .await?
-        .into_iter()
-        .map(|r| Inode::try_from(r).map(|i| (i.name().to_string(), i)))
-        .try_collect()?;
-
-        let mut known = vec![];
-        let mut new = vec![];
-
-        while let Some(inodes) = inodes.try_next().await? {
-            for mut inode in inodes {
-                if let Some(prev_inode) = obsolete.remove(inode.name()) {
-                    if prev_inode.inode_type() != inode.inode_type() {
-                        // an inode with the same name exists, however it has changed type
-                        // better remove the previous entry and replace it with a new one
-                        obsolete.insert(inode.name().to_string(), prev_inode);
-                    } else {
-                        // this is a known inode
-                        inode.set_id(prev_inode.id());
-                    }
-                }
-
-                if inode.id() == 0 {
-                    // this is a new inode
-                    new.push(inode)
-                } else {
-                    // this ia a known inode
-                    known.push(inode)
-                }
-            }
-        }
-
-        if !new.is_empty() || !obsolete.is_empty() {
-            // something has changed here
-            // update the database accordingly
-            let mut tx = self.db.write().begin().await?;
-            for (_, inode) in &obsolete {
-                let id = inode.id() as i64;
-                let _ = sqlx::query!(
-                    "DELETE FROM fs_entries WHERE id = ? AND parent = ?",
-                    id,
-                    parent
-                )
-                .execute(tx.as_mut())
-                .await?;
-            }
-            for inode in &mut new {
-                let inode_type = inode.inode_type();
-                let inode_type = inode_type.as_ref();
-                let name = inode.name();
-                let id = sqlx::query!(
-                    "INSERT INTO fs_entries (name, parent, entry_type) VALUES (?, ?, ?)",
-                    name,
-                    parent,
-                    inode_type,
-                )
-                .execute(tx.as_mut())
-                .await?
-                .last_insert_rowid();
-                inode.set_id(id as u64);
-            }
-            tx.commit().await?;
-        }
-
-        known.extend(new);
-
-        Ok((
-            known,
-            obsolete.values().into_iter().map(|i| i.id()).collect(),
-        ))
-    }
-
-    pub async fn reserve_id(&self, name: &str, parent_id: u64) -> Result<u64> {
-        // Ok, this is a bit of a weird part: we need to know the id of the future file before it's even uploaded!
-        // To achieve this, we do a dummy insert into the `fs_entries` table to get an id, then delete it right away
-        // in the same tx. This is a bit of a hack to effectively reserve an id. Later we do a manual insert using
-        // the id we get now.
-        let mut tx = self.db.write().begin().await?;
-        let parent_id = parent_id as i64;
-        let name = name.to_string();
-        let id = sqlx::query!(
-            "INSERT INTO fs_entries (name, parent, entry_type) VALUES (?, ?, 'F')",
-            name,
-            parent_id,
-        )
-        .execute(tx.as_mut())
-        .await?
-        .last_insert_rowid() as u64;
-        {
-            let id = id as i64;
-            let _ = sqlx::query!("DELETE FROM fs_entries where id = ?", id)
-                .execute(tx.as_mut())
-                .await?;
-        }
-        tx.commit().await?;
-        Ok(id)
-    }
-
-    pub async fn new_file(&self, reserved_id: u64, name: String, parent_id: u64) -> Result<()> {
-        let id = reserved_id as i64;
-        let parent_id = parent_id as i64;
-        let _ = sqlx::query!(
-            "INSERT INTO fs_entries (id, name, parent, entry_type) VALUES (?, ?, ?, 'F')",
-            id,
-            name,
-            parent_id,
-        )
-        .execute(self.db.write())
-        .await?;
-        Ok(())
-    }
-
-    pub async fn delete(&self, id: u64) -> Result<Vec<u64>> {
-        let mut affected_ids = vec![];
-        affected_ids.push(id);
-        let mut tx = self.db.write().begin().await?;
-
-        // first, clean up the temp id table
-        let _ = sqlx::query!("DELETE FROM deleted_fs_entries")
-            .execute(tx.as_mut())
-            .await?;
-
-        // then delete the inode
-        let id = id as i64;
-        let _ = sqlx::query!("DELETE FROM fs_entries WHERE id = ?", id)
-            .execute(tx.as_mut())
-            .await?;
-
-        // the table has a "ON DELETE CASCADE" constraint, so any child inodes have been automatically deleted
-        // the ids of all deleted items will end up in the temp table (this is done by the delete trigger)
-        sqlx::query!("SELECT id FROM deleted_fs_entries")
-            .fetch_all(tx.as_mut())
-            .await?
-            .into_iter()
-            .for_each(|r| {
-                affected_ids.push(r.id as u64);
-            });
-
-        // clean up the temp table again
-        let _ = sqlx::query!("DELETE FROM deleted_fs_entries")
-            .execute(tx.as_mut())
-            .await?;
-
-        tx.commit().await?;
-
-        Ok(affected_ids)
-    }
-
-    pub async fn mv(
-        &self,
-        source_id: u64,
-        target_dir: u64,
-        target_name: String,
-    ) -> Result<Vec<u64>> {
-        let id = source_id as i64;
-        let mut tx = self.db.write().begin().await?;
-        let mut affected_ids = vec![];
-        {
-            let parent = target_dir as i64;
-            sqlx::query!(
-                "UPDATE fs_entries SET name = ?, parent = ? WHERE id = ?",
-                target_name,
-                parent,
-                id
-            )
-            .execute(tx.as_mut())
-            .await?;
-        }
-
-        // find all affected child-inodes
-        sqlx::query!(
-            "WITH RECURSIVE children AS (
-                SELECT id, parent
-                  FROM fs_entries
-                  WHERE parent = ?
-
-                UNION ALL
-
-                SELECT e.id, e.parent
-                  FROM fs_entries e
-                  INNER JOIN children c ON e.parent = c.id
-                  WHERE e.id != c.parent
-            )
-            SELECT DISTINCT(id) FROM children;",
-            id
-        )
-        .fetch_all(tx.as_mut())
-        .await?
-        .into_iter()
-        .for_each(|r| {
-            affected_ids.push(r.id as u64);
-        });
-
-        tx.commit().await?;
-
-        Ok(affected_ids)
+impl From<ObjectId> for InodeId {
+    fn from(value: ObjectId) -> Self {
+        InodeId(value.0)
     }
 }
 
-#[derive(PartialEq, Clone)]
-pub enum InodeType {
-    Directory,
-    File,
-}
+impl TryFrom<InodeId> for ObjectId {
+    type Error = anyhow::Error;
 
-impl Display for InodeType {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_ref())
+    fn try_from(value: InodeId) -> std::result::Result<Self, Self::Error> {
+        let value = value.0;
+        if value < MIN_OBJECT_ID.0 {
+            bail!("not an object id");
+        }
+        Ok(ObjectId(value))
     }
 }
 
-impl AsRef<str> for InodeType {
-    fn as_ref(&self) -> &str {
+#[derive(PartialEq, Clone, Debug)]
+pub enum Inode {
+    Root(Root),
+    Bucket(Bucket),
+    Object(Object),
+}
+
+impl Inode {
+    pub fn id(&self) -> InodeId {
         match self {
-            InodeType::Directory => "D",
-            InodeType::File => "F",
+            Inode::Root(root) => root.id(),
+            Inode::Bucket(bucket) => bucket.id(),
+            Inode::Object(object) => object.id().into(),
         }
-    }
-}
-
-impl FromStr for InodeType {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        if s.eq_ignore_ascii_case("D") {
-            Ok(InodeType::Directory)
-        } else if s.eq_ignore_ascii_case("F") {
-            Ok(InodeType::File)
-        } else {
-            Err(anyhow!("Invalid inode type `{}`", s))
-        }
-    }
-}
-
-#[derive(PartialEq, Clone, Debug)]
-struct InodeInner {
-    id: u64,
-    name: String,
-    size: u64,
-    last_modified: DateTime<Utc>,
-    parent: u64,
-}
-
-#[derive(PartialEq, Clone, Debug)]
-pub(crate) struct Directory {
-    inner: Arc<InodeInner>,
-}
-
-impl Directory {
-    pub(super) fn new(id: u64, name: String, last_modified: DateTime<Utc>, parent: u64) -> Self {
-        Self {
-            inner: Arc::new(InodeInner {
-                id,
-                name,
-                last_modified,
-                parent,
-                size: 0,
-            }),
-        }
-    }
-
-    pub fn id(&self) -> u64 {
-        self.inner.id
-    }
-
-    pub(super) fn set_id(&mut self, id: u64) {
-        Arc::make_mut(&mut self.inner).id = id;
     }
 
     pub fn name(&self) -> &str {
-        self.inner.name.as_str()
+        match self {
+            Inode::Root(root) => root.name(),
+            Inode::Bucket(bucket) => bucket.name(),
+            Inode::Object(object) => object.name(),
+        }
+    }
+
+    pub fn size(&self) -> u64 {
+        match self {
+            Inode::Root(_) => 0,
+            Inode::Bucket(_) => 0,
+            Inode::Object(object) => object.size(),
+        }
     }
 
     pub fn last_modified(&self) -> &DateTime<Utc> {
-        &self.inner.last_modified
+        match self {
+            Inode::Root(root) => root.last_modified(),
+            Inode::Bucket(bucket) => bucket.last_modified(),
+            Inode::Object(object) => object.last_modified(),
+        }
     }
 
-    pub fn parent(&self) -> u64 {
-        self.inner.parent
+    pub fn as_root(&self) -> Option<&Root> {
+        if let Inode::Root(root) = &self {
+            Some(root)
+        } else {
+            None
+        }
+    }
+
+    pub fn as_bucket(&self) -> Option<&Bucket> {
+        if let Inode::Bucket(bucket) = &self {
+            Some(bucket)
+        } else {
+            None
+        }
+    }
+
+    pub fn as_object(&self) -> Option<&Object> {
+        if let Inode::Object(object) = &self {
+            Some(object)
+        } else {
+            None
+        }
+    }
+
+    pub fn as_file(&self) -> Option<&File> {
+        if let Inode::Object(Object::File(file)) = &self {
+            Some(file)
+        } else {
+            None
+        }
+    }
+
+    pub fn as_directory(&self) -> Option<&Directory> {
+        if let Inode::Object(Object::Directory(dir)) = &self {
+            Some(dir)
+        } else {
+            None
+        }
+    }
+
+    pub fn as_parent(&self) -> Option<&dyn Parent> {
+        match self {
+            Inode::Bucket(bucket) => Some(bucket),
+            Inode::Object(Object::Directory(dir)) => Some(dir),
+            _ => None,
+        }
+    }
+
+    pub fn try_into_parent(self) -> std::result::Result<Box<dyn Parent>, Self> {
+        match self {
+            Inode::Bucket(bucket) => Ok(Box::new(bucket)),
+            Inode::Object(Object::Directory(dir)) => Ok(Box::new(dir)),
+            _ => Err(self),
+        }
+    }
+}
+
+impl From<Root> for Inode {
+    fn from(value: Root) -> Self {
+        Inode::Root(value)
+    }
+}
+
+impl TryFrom<Inode> for Root {
+    type Error = Inode;
+
+    fn try_from(value: Inode) -> std::result::Result<Self, Self::Error> {
+        match value {
+            Inode::Root(root) => Ok(root),
+            _ => Err(value),
+        }
+    }
+}
+
+impl From<Bucket> for Inode {
+    fn from(value: Bucket) -> Self {
+        Inode::Bucket(value)
+    }
+}
+
+impl TryFrom<Inode> for Bucket {
+    type Error = Inode;
+
+    fn try_from(value: Inode) -> std::result::Result<Self, Self::Error> {
+        match value {
+            Inode::Bucket(bucket) => Ok(bucket),
+            _ => Err(value),
+        }
+    }
+}
+
+impl From<Object> for Inode {
+    fn from(value: Object) -> Self {
+        Inode::Object(value)
+    }
+}
+
+impl TryFrom<Inode> for Object {
+    type Error = Inode;
+
+    fn try_from(value: Inode) -> std::result::Result<Self, Self::Error> {
+        match value {
+            Inode::Object(object) => Ok(object),
+            _ => Err(value),
+        }
+    }
+}
+
+impl From<File> for Inode {
+    fn from(value: File) -> Self {
+        Inode::Object(Object::File(value))
+    }
+}
+
+impl TryFrom<Inode> for File {
+    type Error = Inode;
+
+    fn try_from(value: Inode) -> std::result::Result<Self, Self::Error> {
+        match value {
+            Inode::Object(Object::File(file)) => Ok(file),
+            _ => Err(value),
+        }
+    }
+}
+
+impl From<Directory> for Inode {
+    fn from(value: Directory) -> Self {
+        Inode::Object(Object::Directory(value))
+    }
+}
+
+impl TryFrom<Inode> for Directory {
+    type Error = Inode;
+
+    fn try_from(value: Inode) -> std::result::Result<Self, Self::Error> {
+        match value {
+            Inode::Object(Object::Directory(dir)) => Ok(dir),
+            _ => Err(value),
+        }
+    }
+}
+
+pub trait Parent: Send + Sync + Debug {
+    fn id(&self) -> InodeId;
+    fn bucket(&self) -> &Bucket;
+    fn path(&self) -> &str;
+    fn object_id(&self) -> Option<ObjectId>;
+    fn to_inode(&self) -> Inode;
+}
+
+impl<P: Parent + ?Sized> Parent for Box<P> {
+    #[inline]
+    fn id(&self) -> InodeId {
+        (**self).id()
+    }
+
+    #[inline]
+    fn bucket(&self) -> &Bucket {
+        (**self).bucket()
+    }
+
+    #[inline]
+    fn path(&self) -> &str {
+        (**self).path()
+    }
+
+    #[inline]
+    fn object_id(&self) -> Option<ObjectId> {
+        (**self).object_id()
+    }
+
+    #[inline]
+    fn to_inode(&self) -> Inode {
+        (**self).to_inode()
     }
 }
 
 #[derive(PartialEq, Clone, Debug)]
-pub(crate) struct File {
-    inner: Arc<InodeInner>,
+pub struct Root {
+    last_modified: DateTime<Utc>,
+}
+
+impl Root {
+    pub fn id(&self) -> InodeId {
+        ROOT_ID.into()
+    }
+
+    pub fn name(&self) -> &str {
+        "ROOT"
+    }
+
+    pub fn last_modified(&self) -> &DateTime<Utc> {
+        &self.last_modified
+    }
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct Bucket {
+    id: InodeId,
+    name: String,
+    last_modified: DateTime<Utc>,
+}
+
+impl Bucket {
+    pub fn id(&self) -> InodeId {
+        self.id
+    }
+
+    pub fn name(&self) -> &str {
+        self.name.as_str()
+    }
+
+    pub fn last_modified(&self) -> &DateTime<Utc> {
+        &self.last_modified
+    }
+}
+
+impl Parent for Bucket {
+    fn id(&self) -> InodeId {
+        self.id()
+    }
+    fn bucket(&self) -> &Bucket {
+        &self
+    }
+
+    fn path(&self) -> &str {
+        "/"
+    }
+
+    fn object_id(&self) -> Option<ObjectId> {
+        None
+    }
+
+    fn to_inode(&self) -> Inode {
+        self.clone().into()
+    }
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub enum Object {
+    File(File),
+    Directory(Directory),
+}
+
+impl Object {
+    pub fn id(&self) -> ObjectId {
+        match self {
+            Object::File(file) => file.id(),
+            Object::Directory(dir) => dir.id(),
+        }
+    }
+
+    fn set_id(&mut self, id: ObjectId) {
+        match self {
+            Object::File(file) => file.set_id(id),
+            Object::Directory(dir) => dir.set_id(id),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            Object::File(file) => file.name(),
+            Object::Directory(dir) => dir.name(),
+        }
+    }
+
+    pub fn bucket(&self) -> &Bucket {
+        match self {
+            Object::File(file) => file.bucket(),
+            Object::Directory(dir) => dir.bucket(),
+        }
+    }
+
+    pub fn path(&self) -> &str {
+        match self {
+            Object::File(file) => file.path(),
+            Object::Directory(dir) => dir.path(),
+        }
+    }
+
+    pub fn parent_id(&self) -> InodeId {
+        match self {
+            Object::File(file) => file.parent_id(),
+            Object::Directory(dir) => dir.parent_id(),
+        }
+    }
+
+    pub fn size(&self) -> u64 {
+        match self {
+            Object::File(file) => file.size(),
+            Object::Directory(dir) => dir.size(),
+        }
+    }
+
+    pub fn last_modified(&self) -> &DateTime<Utc> {
+        match self {
+            Object::File(file) => file.last_modified(),
+            Object::Directory(dir) => dir.last_modified(),
+        }
+    }
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub struct File {
+    inner: Arc<Inner>,
 }
 
 impl File {
-    pub(super) fn new(
-        id: u64,
+    pub fn new(
+        id: ObjectId,
         name: String,
         size: u64,
         last_modified: DateTime<Utc>,
-        parent: u64,
+        parent: Option<ObjectId>,
+        parent_inode: InodeId,
+        path: String,
+        bucket: Bucket,
+        etag: Option<String>,
+        mime_type: Option<String>,
     ) -> Self {
         Self {
-            inner: Arc::new(InodeInner {
+            inner: Arc::new(Inner {
                 id,
                 name,
-                last_modified,
-                parent,
                 size,
+                last_modified,
+                parent_object: parent,
+                parent_inode,
+                path,
+                bucket,
+                etag,
+                mime_type,
             }),
         }
     }
 
-    pub fn id(&self) -> u64 {
+    pub fn id(&self) -> ObjectId {
         self.inner.id
     }
 
-    fn set_id(&mut self, id: u64) {
+    fn set_id(&mut self, id: ObjectId) {
         Arc::make_mut(&mut self.inner).id = id;
+    }
+
+    pub fn parent_id(&self) -> InodeId {
+        self.inner.parent_inode
     }
 
     pub fn name(&self) -> &str {
         self.inner.name.as_str()
+    }
+
+    pub fn bucket(&self) -> &Bucket {
+        &self.inner.bucket
+    }
+
+    pub fn path(&self) -> &str {
+        &self.inner.path
     }
 
     pub fn size(&self) -> u64 {
@@ -562,114 +457,651 @@ impl File {
     pub(super) fn set_last_modified(&mut self, last_modified: DateTime<Utc>) {
         Arc::make_mut(&mut self.inner).last_modified = last_modified;
     }
+}
 
-    pub fn parent(&self) -> u64 {
-        self.inner.parent
+#[derive(PartialEq, Clone, Debug)]
+pub struct Directory {
+    inner: Arc<Inner>,
+}
+
+impl Directory {
+    pub fn id(&self) -> ObjectId {
+        self.inner.id
+    }
+
+    fn set_id(&mut self, id: ObjectId) {
+        Arc::make_mut(&mut self.inner).id = id;
+    }
+
+    pub fn name(&self) -> &str {
+        self.inner.name.as_str()
+    }
+
+    pub fn bucket(&self) -> &Bucket {
+        &self.inner.bucket
+    }
+
+    pub fn path(&self) -> &str {
+        &self.inner.path
+    }
+
+    pub fn parent_id(&self) -> InodeId {
+        self.inner.parent_inode
+    }
+
+    pub fn size(&self) -> u64 {
+        self.inner.size
+    }
+
+    pub fn last_modified(&self) -> &DateTime<Utc> {
+        &self.inner.last_modified
+    }
+}
+
+impl Parent for Directory {
+    fn id(&self) -> InodeId {
+        self.id().into()
+    }
+
+    fn bucket(&self) -> &Bucket {
+        self.bucket()
+    }
+
+    fn path(&self) -> &str {
+        self.path()
+    }
+
+    fn object_id(&self) -> Option<ObjectId> {
+        Some(self.id())
+    }
+
+    fn to_inode(&self) -> Inode {
+        self.clone().into()
     }
 }
 
 #[derive(PartialEq, Clone, Debug)]
-pub(crate) enum Inode {
-    Directory(Directory),
-    File(File),
+struct Inner {
+    id: ObjectId,
+    name: String,
+    size: u64,
+    last_modified: DateTime<Utc>,
+    parent_object: Option<ObjectId>,
+    parent_inode: InodeId,
+    path: String,
+    bucket: Bucket,
+    etag: Option<String>,
+    mime_type: Option<String>,
 }
 
-impl Inode {
-    pub(super) fn new(
-        id: u64,
+pub(super) struct InodeManager {
+    db: SqlitePool,
+    buckets: HashMap<InodeId, Bucket>,
+    root: Root,
+}
+
+impl InodeManager {
+    pub async fn new(db: SqlitePool, buckets: &Vec<String>) -> Result<Self> {
+        let mut to_delete = vec![];
+        let mut missing: HashSet<&String> = buckets.into_iter().collect();
+        let mut buckets = HashMap::new();
+        let mut tx = db.write().begin().await?;
+        for (id, name) in sqlx::query!("SELECT id, name FROM buckets")
+            .fetch_all(tx.as_mut())
+            .await?
+            .into_iter()
+            .map(|r| (InodeId::from(r.id as u64), r.name))
+        {
+            if let Some(_) = missing.take(&name) {
+                buckets.insert(
+                    id,
+                    Bucket {
+                        id,
+                        name,
+                        last_modified: Utc::now(),
+                    },
+                );
+            } else {
+                to_delete.push(id);
+            }
+        }
+
+        for name in missing {
+            let id = (sqlx::query!("INSERT INTO buckets (name) VALUES (?)", name)
+                .execute(tx.as_mut())
+                .await?
+                .last_insert_rowid() as u64)
+                .into();
+            buckets.insert(
+                id,
+                Bucket {
+                    id,
+                    name: name.to_string(),
+                    last_modified: Utc::now(),
+                },
+            );
+            tracing::debug!(id = %id, bucket = name, "new bucket created");
+        }
+
+        for id in to_delete {
+            let id = id.value() as i64;
+            let rows_affected = sqlx::query!("DELETE FROM buckets WHERE id = ?", id)
+                .execute(tx.as_mut())
+                .await?
+                .rows_affected();
+            tracing::debug!(
+                id = id,
+                rows_affected = rows_affected,
+                "obsolete bucket deleted"
+            );
+        }
+
+        clear_affected_object_ids(&mut tx).await?;
+
+        tx.commit().await?;
+
+        Ok(Self {
+            db,
+            buckets,
+            root: Root {
+                last_modified: Utc::now(),
+            },
+        })
+    }
+
+    pub fn root(&self) -> Inode {
+        Inode::Root(self.root.clone())
+    }
+
+    pub async fn inode_by_id(&self, id: InodeId) -> Result<Option<Inode>> {
+        if id == ROOT_INODE_ID {
+            return Ok(Some(Inode::Root(self.root.clone())));
+        }
+
+        if id < MIN_BUCKET_ID {
+            bail!("inode id ({}) in reserved range, do not use!", id);
+        }
+
+        if id >= MIN_BUCKET_ID && id < MIN_OBJECT_ID {
+            // bucket range
+            return Ok(self.buckets.get(&id).map(|b| Inode::Bucket(b.clone())));
+        }
+
+        let id = id.value() as i64;
+        Ok(sqlx::query_as!(
+                ObjectRecord,
+                "SELECT id, inode_type, name, size, last_modified, parent, path, bucket, etag, mime_type FROM objects WHERE id = ?",
+                id
+            ).fetch_optional(self.db.read()).await?.map(|r| {
+            let bucket_id = (r.bucket as u64).into();
+            let bucket = self.buckets.get(&bucket_id).ok_or(anyhow::anyhow!("no known bucket with id: {}", bucket_id))?.clone();
+            Object::try_from((r, bucket))
+        }).transpose()?.map(|o| o.into()))
+    }
+
+    pub async fn reserve_id(&self) -> Result<ObjectId> {
+        Ok(sqlx::query!(
+            "UPDATE sqlite_sequence
+                SET seq = seq + 1
+                WHERE name = 'objects';
+            SELECT seq FROM sqlite_sequence WHERE name = 'objects';
+            "
+        )
+        .fetch_one(self.db.write())
+        .await
+        .map(|r| r.seq.unwrap() as u64)?
+        .into())
+    }
+
+    pub async fn new_file<P: Parent + ?Sized>(
+        &self,
+        reserved_id: ObjectId,
         name: String,
         size: u64,
         last_modified: DateTime<Utc>,
-        parent: u64,
-        inode_type: InodeType,
-    ) -> Self {
-        match inode_type {
-            InodeType::Directory => {
-                Inode::Directory(Directory::new(id, name, last_modified, parent))
+        parent: &P,
+    ) -> Result<()> {
+        let id = reserved_id.value() as i64;
+        let size = size as i64;
+        let parent_id = parent.object_id().map(|id| id.value() as i64);
+        let bucket_id = parent.bucket().id().value() as i64;
+
+        let mut tx = self.db.write().begin().await?;
+
+        let _ = sqlx::query!(
+            "INSERT INTO objects (id, inode_type, name, size, last_modified, parent, bucket) VALUES (?, 'F', ?, ?, ?, ?, ?)",
+            id,
+            name,
+            size,
+            last_modified,
+            parent_id,
+            bucket_id
+        )
+            .execute(tx.as_mut())
+            .await?;
+
+        self.reset_last_sync(&vec![parent.id()], &mut tx).await?;
+        tx.commit().await?;
+
+        Ok(())
+    }
+
+    pub async fn delete(&self, object: &Object) -> Result<Vec<ObjectId>> {
+        let mut affected_ids = HashSet::new();
+        affected_ids.insert(object.id());
+        let mut tx = self.db.write().begin().await?;
+
+        clear_affected_object_ids(&mut tx).await?;
+
+        let id = object.id().value() as i64;
+        let _ = sqlx::query!("DELETE FROM objects WHERE id = ?", id)
+            .execute(tx.as_mut())
+            .await?;
+
+        self.reset_last_sync(&vec![object.parent_id()], &mut tx)
+            .await?;
+
+        collect_affected_object_ids(&mut tx, &mut affected_ids).await?;
+
+        tx.commit().await?;
+
+        Ok(affected_ids.into_iter().collect_vec())
+    }
+
+    pub async fn mv<P: Parent + ?Sized>(
+        &self,
+        object: &Object,
+        target_parent: &P,
+        target_name: Option<&str>,
+    ) -> Result<Vec<ObjectId>> {
+        if target_name.is_none()
+            && target_parent.object_id().is_some()
+            && target_parent.object_id().unwrap() == object.id()
+        {
+            // nothing to do
+            return Ok(vec![]);
+        }
+
+        if target_parent.bucket().id() != object.bucket().id() {
+            bail!("cannot move object across buckets");
+        }
+
+        let mut affected_ids = HashSet::new();
+        affected_ids.insert(object.id());
+
+        let id = object.id().value() as i64;
+        let mut tx = self.db.write().begin().await?;
+
+        clear_affected_object_ids(&mut tx).await?;
+
+        let parent = target_parent.object_id().map(|id| id.value() as i64);
+        let _ = match target_name {
+            Some(target_name) => {
+                sqlx::query!(
+                    "UPDATE objects SET name = ?, parent = ? WHERE id = ?",
+                    target_name,
+                    parent,
+                    id
+                )
+                .execute(tx.as_mut())
+                .await?
             }
-            InodeType::File => Inode::File(File::new(id, name, size, last_modified, parent)),
-        }
-    }
-
-    pub fn id(&self) -> u64 {
-        match &self {
-            Inode::File(file) => file.id(),
-            Inode::Directory(dir) => dir.id(),
-        }
-    }
-
-    pub(super) fn set_id(&mut self, id: u64) {
-        match self {
-            Inode::File(file) => file.set_id(id),
-            Inode::Directory(dir) => dir.set_id(id),
-        }
-    }
-
-    pub fn name(&self) -> &str {
-        match &self {
-            Inode::File(file) => file.name(),
-            Inode::Directory(dir) => dir.name(),
-        }
-    }
-
-    pub fn parent(&self) -> u64 {
-        match self {
-            Inode::File(file) => file.parent(),
-            Inode::Directory(dir) => dir.parent(),
-        }
-    }
-
-    pub fn inode_type(&self) -> InodeType {
-        match &self {
-            Inode::File(_) => InodeType::File,
-            Inode::Directory(_) => InodeType::Directory,
-        }
-    }
-
-    pub fn last_modified(&self) -> &DateTime<Utc> {
-        match self {
-            Inode::File(file) => file.last_modified(),
-            Inode::Directory(dir) => dir.last_modified(),
-        }
-    }
-
-    pub fn size(&self) -> Option<u64> {
-        match self {
-            Inode::File(file) => Some(file.size()),
-            Inode::Directory(_) => None,
-        }
-    }
-
-    pub(super) fn to_path(&self, parent_path: &str) -> String {
-        let tail = if self.inode_type() == InodeType::Directory {
-            "/"
-        } else {
-            ""
+            None => {
+                sqlx::query!("UPDATE objects SET parent = ? WHERE id = ?", parent, id)
+                    .execute(tx.as_mut())
+                    .await?
+            }
         };
-        format!("{}{}{}", parent_path, self.name(), tail)
+
+        self.reset_last_sync(&vec![object.parent_id(), target_parent.id()], &mut tx)
+            .await?;
+
+        collect_affected_object_ids(&mut tx, &mut affected_ids).await?;
+
+        tx.commit().await?;
+
+        Ok(affected_ids.into_iter().collect_vec())
     }
+
+    pub fn buckets(&self) -> impl Iterator<Item = &Bucket> {
+        self.buckets.values()
+    }
+
+    pub async fn last_sync<P: Parent + ?Sized>(&self, parent: &P) -> Result<Option<DateTime<Utc>>> {
+        if let Some(parent_id) = parent.object_id().map(|o| o.value() as i64) {
+            // a regular directory
+            Ok(
+                sqlx::query!("SELECT last_sync FROM objects WHERE id = ?", parent_id,)
+                    .fetch_optional(self.db.read())
+                    .await?
+                    .map(|r| r.last_sync.and_utc()),
+            )
+        } else {
+            // bucket root
+            let bucket_id = parent.bucket().id().value() as i64;
+            Ok(
+                sqlx::query!("SELECT last_sync FROM buckets WHERE id = ?", bucket_id,)
+                    .fetch_optional(self.db.read())
+                    .await?
+                    .map(|r| r.last_sync.and_utc()),
+            )
+        }
+    }
+
+    async fn reset_last_sync(
+        &self,
+        ids: &Vec<InodeId>,
+        tx: &mut Transaction<'_, Sqlite>,
+    ) -> Result<usize> {
+        let mut affected = 0;
+        for inode_id in ids {
+            let id = inode_id.value() as i64;
+            if inode_id < &MIN_OBJECT_ID {
+                // bucket
+                affected += sqlx::query!(
+                    "UPDATE buckets SET last_sync = '1970-01-01 00:00:00' WHERE id = ?",
+                    id,
+                )
+                .execute(tx.as_mut())
+                .await?
+                .rows_affected() as usize;
+            } else {
+                // regular object
+                affected += sqlx::query!(
+                    "UPDATE objects SET last_sync = '1970-01-01 00:00:00' WHERE id = ?",
+                    id,
+                )
+                .execute(tx.as_mut())
+                .await?
+                .rows_affected() as usize;
+            }
+        }
+        Ok(affected)
+    }
+
+    pub async fn read_dir<P: Parent + ?Sized>(&self, parent: &P) -> Result<Vec<Object>> {
+        self._read_dir(parent, self.db.read()).await
+    }
+
+    async fn _read_dir<'a, P: Parent + ?Sized>(
+        &self,
+        parent: &P,
+        executor: impl SqliteExecutor<'a>,
+    ) -> Result<Vec<Object>> {
+        let bucket_id = parent.bucket().id().value() as i64;
+        let parent_id = parent.object_id().map(|oid| oid.value() as i64);
+
+        Ok(sqlx::query_as!(
+            ObjectRecord,
+            "SELECT id, inode_type, name, size, last_modified, parent, path, bucket, etag, mime_type FROM objects WHERE bucket = ? AND (parent IS ? OR parent = ?)",
+            bucket_id,
+            parent_id,
+            parent_id,
+        )
+               .fetch_all(executor)
+               .await?
+               .into_iter()
+               .map(|r| Object::try_from((r, parent.bucket().clone())))
+               .try_collect()?)
+    }
+
+    pub async fn sync_dir<P: Parent + ?Sized>(
+        &self,
+        parent: &P,
+        mut metadata: impl Stream<Item = Result<Vec<Metadata>>> + Unpin,
+    ) -> Result<(Vec<Object>, Vec<ObjectId>)> {
+        let bucket_id = parent.bucket().id().value() as i64;
+        let parent_id = parent.object_id().map(|oid| oid.value() as i64);
+
+        let mut tx = self.db.write().begin().await?;
+        clear_affected_object_ids(&mut tx).await?;
+
+        let mut obsolete: HashMap<_, _> = self
+            ._read_dir(parent, tx.as_mut())
+            .await?
+            .into_iter()
+            .map(|o| (o.name().to_string(), o))
+            .collect();
+
+        let mut changed = vec![];
+        let mut new = vec![];
+        let mut affected_ids = HashSet::new();
+
+        while let Some(metadata) = metadata.try_next().await? {
+            for metadata in metadata {
+                let mut object = Object::try_from((metadata, parent))?;
+                if let Some(prev_object) = obsolete.remove(object.name()) {
+                    // known object
+                    object.set_id(prev_object.id());
+                    if prev_object != object {
+                        // this object has changed since last sync
+                        changed.push((object, prev_object));
+                    }
+                } else {
+                    // new object
+                    new.push(object);
+                }
+            }
+        }
+
+        // delete all obsolete objects first
+        for (_, object) in obsolete {
+            let id = object.id().value() as i64;
+            sqlx::query!("DELETE FROM objects WHERE id = ?", id,)
+                .execute(tx.as_mut())
+                .await?;
+        }
+
+        // update all changed objects
+        for (object, prev_object) in changed {
+            let id = object.id().value() as i64;
+            let inode_type = match object {
+                Object::File(_) => "F",
+                Object::Directory(_) => "D",
+            };
+            let name = object.name();
+            let size = object.size() as i64;
+            let last_modified = object.last_modified();
+
+            if discriminant(&prev_object) != discriminant(&object) {
+                // the type has changed, delete and reinsert
+                sqlx::query!("DELETE FROM objects WHERE id = ?", id)
+                    .execute(tx.as_mut())
+                    .await?;
+
+                sqlx::query!(
+                    "INSERT INTO objects (id, name, inode_type, size, last_modified, parent, bucket) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    id,
+                    name,
+                    inode_type,
+                    size,
+                    last_modified,
+                    parent_id,
+                    bucket_id,
+                )
+                    .execute(tx.as_mut())
+                    .await?;
+            } else {
+                // regular change, a simple update is sufficient
+                sqlx::query!(
+                    "UPDATE objects SET size = ?, last_modified = ? WHERE id = ?",
+                    size,
+                    last_modified,
+                    id,
+                )
+                .execute(tx.as_mut())
+                .await?;
+            }
+
+            affected_ids.insert(object.id());
+        }
+
+        // insert new objects
+        for object in new {
+            let inode_type = match object {
+                Object::File(_) => "F",
+                Object::Directory(_) => "D",
+            };
+
+            let name = object.name();
+            let size = object.size() as i64;
+            let last_modified = object.last_modified();
+
+            let id = sqlx::query!(
+                "INSERT INTO objects (name, inode_type, size, last_modified, parent, bucket) VALUES (?, ?, ?, ?, ?, ?)",
+                    name,
+                    inode_type,
+                    size,
+                    last_modified,
+                    parent_id,
+                    bucket_id,
+                )
+                .execute(tx.as_mut())
+                .await?
+                .last_insert_rowid();
+
+            affected_ids.insert(ObjectId::from(id as u64));
+        }
+
+        // update last_sync
+        if let Some(parent_id) = parent_id {
+            // regular directory
+            sqlx::query!(
+                "UPDATE objects SET last_sync = CURRENT_TIMESTAMP WHERE id = ?",
+                parent_id,
+            )
+            .execute(tx.as_mut())
+            .await?;
+        } else {
+            // bucket root
+            sqlx::query!(
+                "UPDATE buckets SET last_sync = CURRENT_TIMESTAMP WHERE id = ?",
+                bucket_id,
+            )
+            .execute(tx.as_mut())
+            .await?;
+        }
+
+        collect_affected_object_ids(&mut tx, &mut affected_ids).await?;
+
+        let objects = self._read_dir(parent, tx.as_mut()).await?;
+
+        tx.commit().await?;
+
+        Ok((objects, affected_ids.into_iter().collect()))
+    }
+}
+
+async fn clear_affected_object_ids(tx: &mut Transaction<'_, Sqlite>) -> Result<()> {
+    sqlx::query!("DELETE FROM affected_objects")
+        .execute(tx.as_mut())
+        .await?;
+    Ok(())
+}
+
+async fn collect_affected_object_ids(
+    tx: &mut Transaction<'_, Sqlite>,
+    affected_ids: &mut HashSet<ObjectId>,
+) -> Result<()> {
+    sqlx::query!("SELECT id FROM affected_objects")
+        .fetch_all(tx.as_mut())
+        .await?
+        .into_iter()
+        .for_each(|r| {
+            affected_ids.insert((r.id as u64).into());
+        });
+
+    let _ = sqlx::query!("DELETE FROM affected_objects")
+        .execute(tx.as_mut())
+        .await?;
+
+    Ok(())
 }
 
 #[derive(FromRow)]
-pub(super) struct InodeRecord {
-    pub(super) id: i64,
-    pub(super) name: String,
-    pub(super) parent: i64,
-    pub(super) entry_type: String,
+struct ObjectRecord {
+    id: i64,
+    name: String,
+    inode_type: String,
+    size: i64,
+    last_modified: NaiveDateTime,
+    parent: Option<i64>,
+    bucket: i64,
+    path: String,
+    etag: Option<String>,
+    mime_type: Option<String>,
 }
 
-impl TryFrom<InodeRecord> for Inode {
+impl<P> TryFrom<(Metadata, &P)> for Object
+where
+    P: Parent + ?Sized,
+{
     type Error = anyhow::Error;
 
-    fn try_from(r: InodeRecord) -> std::result::Result<Self, Self::Error> {
-        let inode_type = InodeType::from_str(r.entry_type.as_str())?;
-        Ok(Inode::new(
-            r.id as u64,
-            r.name,
-            0,
-            Utc::now(),
-            r.parent as u64,
-            inode_type,
-        ))
+    fn try_from((metadata, parent): (Metadata, &P)) -> std::result::Result<Self, Self::Error> {
+        let name = match metadata.name.strip_prefix(parent.path()) {
+            Some(name) => name,
+            None => bail!("path does not match name"),
+        };
+
+        let (name, is_dir) = match name.split_once('/') {
+            None => (name, false),
+            Some((name, suffix)) if suffix.is_empty() && !name.is_empty() => (name, true),
+            _ => {
+                bail!("invalid name: {}", name);
+            }
+        };
+
+        let last_modified = metadata.mod_time.to_utc();
+
+        let inner = Arc::new(Inner {
+            id: 0.into(),
+            name: name.to_string(),
+            size: metadata.size,
+            last_modified,
+            parent_object: parent.object_id(),
+            parent_inode: parent.id(),
+            path: metadata.name,
+            bucket: parent.bucket().clone(),
+            etag: metadata.etag,
+            mime_type: metadata.mime_type,
+        });
+
+        Ok(if is_dir {
+            Object::Directory(Directory { inner })
+        } else {
+            Object::File(File { inner })
+        })
+    }
+}
+
+impl TryFrom<(ObjectRecord, Bucket)> for Object {
+    type Error = anyhow::Error;
+    fn try_from((r, bucket): (ObjectRecord, Bucket)) -> Result<Self> {
+        let parent_object = r.parent.map(|p| (p as u64).into());
+        let parent_inode = parent_object
+            .map(|id: ObjectId| id.into())
+            .unwrap_or_else(|| bucket.id());
+
+        let inner = Arc::new(Inner {
+            id: (r.id as u64).into(),
+            name: r.name,
+            bucket,
+            path: r.path,
+            parent_object,
+            parent_inode,
+            last_modified: r.last_modified.and_utc(),
+            size: r.size as u64,
+            etag: r.etag,
+            mime_type: r.mime_type,
+        });
+
+        Ok(match r.inode_type.as_str() {
+            "F" => Object::File(File { inner }),
+            "D" => Object::Directory(Directory { inner }),
+            _ => {
+                bail!("invalid inode_type: {}", r.inode_type);
+            }
+        })
     }
 }

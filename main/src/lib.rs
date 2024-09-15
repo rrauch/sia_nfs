@@ -62,6 +62,7 @@ impl SiaNfs {
                 &buckets,
                 NonZeroUsize::new(5).unwrap(),
                 NonZeroU64::new(1024 * 1024 * 1).unwrap(),
+                Duration::from_secs(300),
             )
             .await?,
         );
@@ -96,6 +97,8 @@ async fn db_init(
                 // `auto_vacuum` needs to be executed before `journal_mode`
                 .auto_vacuum(SqliteAutoVacuum::Full)
                 .journal_mode(SqliteJournalMode::Wal)
+                .foreign_keys(true)
+                .pragma("recursive_triggers", "ON")
                 .busy_timeout(Duration::from_millis(100))
                 .shared_cache(true)
         })

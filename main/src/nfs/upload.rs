@@ -4,9 +4,8 @@ use crate::io_scheduler::resource_manager::{
 };
 use crate::io_scheduler::Scheduler;
 use crate::vfs::file_writer::FileWriter;
-use crate::vfs::inode::Inode;
 use crate::vfs::Vfs;
-use anyhow::bail;
+use anyhow::{anyhow, bail};
 use futures_util::future::BoxFuture;
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,26 +38,26 @@ impl ResourceManager for Upload {
         preparation_key: &Self::PreparationKey,
     ) -> anyhow::Result<(Self::AccessKey, Self::ResourceData, Vec<Self::Resource>)> {
         let (parent_id, name) = preparation_key;
-        let parent = match self.vfs.inode_by_id(*parent_id).await? {
-            Some(Inode::Directory(dir)) => dir,
-            Some(Inode::File(_)) => {
-                bail!("parent not a directory");
-            }
-            None => {
-                bail!("parent does not exist");
-            }
-        };
+        let parent = self
+            .vfs
+            .inode_by_id((*parent_id).into())
+            .await?
+            .ok_or(anyhow!("parent not found"))?;
 
-        let fw = self.vfs.write_file(&parent, name.to_string()).await?;
+        let parent = parent
+            .as_parent()
+            .ok_or(anyhow!("inode cannot have children"))?;
+
+        let fw = self.vfs.write_file(parent, name.to_string()).await?;
         let file = fw.to_file();
 
         tracing::debug!(
-            file_id = file.id(),
+            file_id = %file.id(),
             file_name = file.name(),
             "upload prepared"
         );
 
-        Ok((file.id(), (), vec![fw]))
+        Ok((file.id().value(), (), vec![fw]))
     }
 
     fn process(

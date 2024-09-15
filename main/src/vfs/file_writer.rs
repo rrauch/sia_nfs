@@ -1,4 +1,4 @@
-use crate::vfs::inode::{File, Inode};
+use crate::vfs::inode::{File, Inode, InodeId, Object, ObjectId, Parent};
 use crate::vfs::locking::LockHolder;
 use crate::vfs::{PendingWrites, Vfs};
 use anyhow::anyhow;
@@ -14,10 +14,9 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 pub(crate) struct FileWriter {
-    id: u64,
+    id: ObjectId,
     name: String,
-    parent: u64,
-    bucket: String,
+    parent: Box<dyn Parent>,
     path: String,
     stream: Option<DuplexStream>,
     _locks: Vec<LockHolder>,
@@ -67,7 +66,11 @@ impl AsyncWrite for FileWriter {
                 Ok(()) => {
                     // was properly closed, discard stream
                     let _ = self.stream.take();
-                    tracing::debug!("FileWriter for /{}{} closed", self.bucket, self.path);
+                    tracing::debug!(
+                        "FileWriter for /{}{} closed",
+                        self.parent.bucket().name(),
+                        self.path
+                    );
                 }
                 Err(_) => {
                     self.error_count += 1;
@@ -80,12 +83,11 @@ impl AsyncWrite for FileWriter {
 }
 
 impl FileWriter {
-    pub(super) fn new(
-        reserved_id: u64,
+    pub(super) fn new<P: Parent + ?Sized>(
+        reserved_id: ObjectId,
         name: String,
-        bucket: String,
+        parent: &P,
         path: String,
-        parent_id: u64,
         vfs: Arc<Vfs>,
         locks: Vec<LockHolder>,
         upload_task: JoinHandle<std::result::Result<(), renterd_client::Error>>,
@@ -97,9 +99,8 @@ impl FileWriter {
             id: reserved_id,
             vfs,
             name,
-            bucket,
+            parent: parent.to_inode().try_into_parent().unwrap(),
             path,
-            parent: parent_id,
             _locks: locks,
             upload_task: Some(upload_task),
             stream: Some(stream),
@@ -117,20 +118,12 @@ impl FileWriter {
         })
     }
 
-    pub fn file_id(&self) -> u64 {
+    pub fn file_id(&self) -> ObjectId {
         self.id
-    }
-
-    pub fn parent_id(&self) -> u64 {
-        self.parent
     }
 
     pub fn name(&self) -> &str {
         self.name.as_str()
-    }
-
-    pub fn bucket(&self) -> &str {
-        self.bucket.as_str()
     }
 
     pub fn path(&self) -> &str {
@@ -155,7 +148,12 @@ impl FileWriter {
             self.name.clone(),
             self.bytes_written,
             self.last_modified,
-            self.parent,
+            self.parent.object_id(),
+            self.parent.id(),
+            self.path.clone(),
+            self.parent.bucket().clone(),
+            None,
+            None,
         )
     }
 
@@ -178,37 +176,36 @@ impl FileWriter {
             .expect("JoinHandle went missing")
             .await??;
 
-        // add the new file to the db using the id we previously "reserved"
+        // add the new file to the db using the id we previously reserved
         self.vfs
             .inode_manager
-            .new_file(self.id, self.name.clone(), self.parent_id())
+            .new_file(
+                self.id,
+                self.name.clone(),
+                self.bytes_written,
+                self.last_modified,
+                &self.parent,
+            )
             .await?;
 
-        // update caches
+        let affected_ids = vec![InodeId::from(self.id), self.parent.id()];
         self.vfs
             .cache_manager
-            .new_file(self.id, self.parent_id())
+            .invalidate_caches(&affected_ids)
             .await;
 
+        self.pending_writes
+            .remove(self.id.value(), self.parent.id().value());
+
+        let parent_inode = self.parent.to_inode();
         let file = match self
             .vfs
-            .inode_by_name_parent(&self.name, self.parent)
+            .inode_by_name_parent(&self.name, &parent_inode)
             .await?
         {
-            Some(Inode::File(file)) => Ok(file),
+            Some(Inode::Object(Object::File(file))) => Ok(file),
             _ => Err(anyhow!("uploaded inode invalid")),
         }?;
-
-        let (bucket, path) = self
-            .vfs
-            .inode_to_bucket_path(Inode::File(file.clone()))
-            .await?
-            .ok_or(anyhow!("uploaded inode invalid"))?;
-
-        self.vfs
-            .cache_manager
-            .invalidate_bucket_path(bucket, path)
-            .await;
 
         Ok(file)
     }
@@ -219,7 +216,7 @@ impl Drop for FileWriter {
         if !self.is_closed() {
             tracing::warn!(
                 "FileWriter for /{}{} dropped before closing, data corruption possible!",
-                self.bucket,
+                self.parent.bucket().name(),
                 self.path
             );
         }
@@ -227,10 +224,11 @@ impl Drop for FileWriter {
             upload_task.abort();
             tracing::warn!(
                 "upload_task for /{}{} had to be aborted, data corruption possible!",
-                self.bucket,
+                self.parent.bucket().name(),
                 self.path
             )
         }
-        self.pending_writes.remove(self.id, self.parent);
+        self.pending_writes
+            .remove(self.id.value(), self.parent.id().value());
     }
 }

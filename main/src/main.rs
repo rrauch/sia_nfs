@@ -70,7 +70,7 @@ async fn main() -> anyhow::Result<()> {
     let arguments = Arguments::parse();
 
     tokio::fs::create_dir_all(&arguments.data_dir).await?;
-    let db_path = arguments.data_dir.join("sia_nfs.sqlite");
+    let db_path = arguments.data_dir.join("sia_nfs_meta.sqlite");
 
     let disk_cache = if arguments.max_cache_size.as_u64() > 0 {
         let cache_dir = arguments.cache_dir.unwrap_or_else(|| arguments.data_dir);
