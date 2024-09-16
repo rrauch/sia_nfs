@@ -41,9 +41,9 @@ The server has been tested on Linux (x86_64). Clients have been tested on Linux,
 
 ## Test Drive
 
-A `Dockerfile` is included to make it easy for you to try out `sia_nfs`.
+A `Dockerfile` as well as a pre-built image is available to make it easy for you to try out `sia_nfs`.
 
-### Build
+### Build from Source
 
 ```bash
 # Clone the repository
@@ -51,6 +51,15 @@ git clone https://github.com/rrauch/sia_nfs.git
 cd sia_nfs
 # Build the Docker image
 docker build ./ -t sia_nfs
+```
+
+or
+
+### Pull from Github Container Registry
+
+```bash
+docker pull ghcr.io/rrauch/sia_nfs:latest
+docker tag ghcr.io/rrauch/sia_nfs:latest sia_nfs:latest
 ```
 
 ### Run
