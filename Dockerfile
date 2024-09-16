@@ -16,22 +16,12 @@ RUN cd /usr/local/src/ \
  && cargo build --release \
  && cp target/release/depres /usr/local/bin/
 
-# Pre-fetch and compile all required Rust crates.
 COPY Cargo.* /usr/local/src/sia_nfs/
-
-RUN cd /usr/local/src/sia_nfs/ \
- && mkdir src \
- && echo "// dummy file" > src/lib.rs \
- && echo "fn main() {}" > build.rs \
- && cargo build --release
+COPY cachalot /usr/local/src/sia_nfs/cachalot/
+COPY main /usr/local/src/sia_nfs/main/
 
 # Build the `sia_nfs` binary.
-COPY migrations /usr/local/src/sia_nfs/migrations/
-COPY build.rs /usr/local/src/sia_nfs/
-COPY src /usr/local/src/sia_nfs/src/
-
 RUN cd /usr/local/src/sia_nfs/ \
- && touch build.rs \
  && cargo build --release \
  && cp ./target/release/sia_nfs /usr/local/bin/
 
@@ -61,7 +51,7 @@ COPY --from=builder /export/ /
 
 VOLUME /config
 EXPOSE 12000
-ENV DATA_PATH="/config/"
+ENV DATA_DIR="/config/"
 ENV LISTEN_ADDRESS="0.0.0.0:12000"
 
 ENTRYPOINT ["/usr/local/bin/sia_nfs"]
