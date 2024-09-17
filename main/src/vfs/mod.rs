@@ -300,6 +300,10 @@ impl Vfs {
 
     #[instrument(skip(self))]
     pub async fn rm(&self, object: &Object) -> Result<()> {
+        if self.pending_writes.by_id(object.id().value()).is_some() {
+            bail!("cannot delete file that is currently being written to");
+        }
+
         let parent = self
             .inode_by_id(object.parent_id())
             .await?

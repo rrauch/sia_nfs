@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::future;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
@@ -116,6 +116,7 @@ where
     resource_tx: mpsc::Sender<(u64, Response<RM::Resource>)>,
     runner: JoinHandle<()>,
     ct: CancellationToken,
+    close_notifier: Arc<Notify>,
     _drop_guard: DropGuard,
 }
 
@@ -132,7 +133,9 @@ impl<RM: ResourceManager + Send + Sync + 'static> Queue<RM> {
         let (resource_tx, resource_rx) = mpsc::channel(10);
         let (return_tx, return_rx) = mpsc::channel(10);
         let ct = CancellationToken::new();
+        let close_notifier = Arc::new(Notify::new());
         let runner = {
+            let close_notifier = close_notifier.clone();
             let queue = QueueInner::new(
                 initial_resources,
                 ct.clone(),
@@ -152,6 +155,7 @@ impl<RM: ResourceManager + Send + Sync + 'static> Queue<RM> {
                     resource_rx,
                     return_rx,
                     term_fn,
+                    close_notifier,
                 )
                 .await;
             })
@@ -161,6 +165,7 @@ impl<RM: ResourceManager + Send + Sync + 'static> Queue<RM> {
             resource_tx,
             runner,
             ct: ct.clone(),
+            close_notifier,
             _drop_guard: ct.drop_guard(),
         }
     }
@@ -172,6 +177,11 @@ impl<RM: ResourceManager + Send + Sync + 'static> Queue<RM> {
         let (res_tx, res_rx) = oneshot::channel();
         self.resource_tx.send((offset, res_tx)).await?;
         res_rx.await?
+    }
+
+    pub(super) fn close(&self) -> Arc<Notify> {
+        self.ct.cancel();
+        self.close_notifier.clone()
     }
 
     pub(super) async fn shutdown(self) {
@@ -186,6 +196,7 @@ impl<RM: ResourceManager + Send + Sync + 'static> Queue<RM> {
         mut resource_rx: mpsc::Receiver<(u64, Response<RM::Resource>)>,
         mut return_rx: mpsc::Receiver<(usize, RM::Resource)>,
         mut term_fn: Option<Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send>>,
+        close_notifier: Arc<Notify>,
     ) {
         let mut prepare_resources: JoinSet<(usize, Result<<RM as ResourceManager>::Resource>)> =
             JoinSet::new();
@@ -353,6 +364,8 @@ impl<RM: ResourceManager + Send + Sync + 'static> Queue<RM> {
         // wait for all tasks to end
         while let Some(_) = prepare_resources.join_next().await {}
         while let Some(_) = finalize_resources.join_next().await {}
+
+        close_notifier.notify_waiters();
     }
 }
 

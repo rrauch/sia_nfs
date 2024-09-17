@@ -213,11 +213,14 @@ impl NFSFileSystem for SiaNfsFs {
     }
 
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
-        let object = self
+        let object: Object = self
             .inode_by_dir_name(dirid, filename)
             .await?
             .try_into()
             .map_err(|_| NFS3ERR_NOTSUPP)?;
+
+        // if this is a pending upload, close it first
+        self.uploader.close(object.id().as_ref()).await;
 
         self.vfs.rm(&object).await.map_err(|e| {
             tracing::error!(err = %e, "rm failed");

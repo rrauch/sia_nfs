@@ -49,7 +49,7 @@ impl<RM: ResourceManager + 'static + Send + Sync> Scheduler<RM> {
             key_map: BiHashMap::new(),
         }));
 
-        let (term_tx, mut term_rx) = mpsc::channel(10);
+        let (term_tx, mut term_rx) = mpsc::channel::<<RM as ResourceManager>::PreparationKey>(10);
 
         let _reaper = {
             let state = state.clone();
@@ -59,12 +59,16 @@ impl<RM: ResourceManager + 'static + Send + Sync> Scheduler<RM> {
                         let state = &mut state.write();
                         state.key_map.remove_by_left(&preparation_key);
                         if let Some(Status::Ready(queue)) = state.queues.remove(&preparation_key) {
+                            state
+                                .queues
+                                .insert(preparation_key.clone(), Status::Closing(queue.close()));
                             Some(queue)
                         } else {
                             None
                         }
                     };
                     if let Some(mut queue) = queue {
+                        let state = state.clone();
                         tokio::spawn(async move {
                             tracing::debug!("shutting down queue {:?}", preparation_key);
                             let queue = loop {
@@ -77,6 +81,9 @@ impl<RM: ResourceManager + 'static + Send + Sync> Scheduler<RM> {
                                 }
                             };
                             queue.shutdown().await;
+                            let state = &mut state.write();
+                            state.key_map.remove_by_left(&preparation_key);
+                            state.queues.remove(&preparation_key);
                             tracing::trace!("queue {:?} shutdown complete", preparation_key);
                         });
                     }
@@ -130,6 +137,7 @@ impl<RM: ResourceManager + 'static + Send + Sync> Scheduler<RM> {
                             );
                         }
                     }
+                    Some(Status::Closing(notify)) => (notify.clone(), None),
                 }
             };
 
@@ -209,6 +217,32 @@ impl<RM: ResourceManager + 'static + Send + Sync> Scheduler<RM> {
         tracing::trace!(success = resp.is_ok(), "access response");
         Ok(resp?)
     }
+
+    #[instrument(skip(self))]
+    pub async fn close(&self, access_key: &RM::AccessKey) {
+        loop {
+            let notify = {
+                let state = self.state.read();
+                if let Some(preparation_key) = state.key_map.get_by_right(access_key) {
+                    match state.queues.get(preparation_key) {
+                        Some(Status::Ready(queue)) => {
+                            tracing::debug!("closing queue");
+                            Some(queue.close())
+                        },
+                        Some(Status::Closing(close_notify)) => Some(close_notify.clone()),
+                        Some(Status::Preparing(prep_notify)) => Some(prep_notify.clone()),
+                        None => None,
+                    }
+                } else {
+                    None
+                }
+            };
+            match notify {
+                Some(notify) => notify.notified().await,
+                None => break,
+            }
+        }
+    }
 }
 
 enum Status<RM: ResourceManager>
@@ -217,4 +251,5 @@ where
 {
     Preparing(Arc<Notify>),
     Ready(Arc<Queue<RM>>),
+    Closing(Arc<Notify>),
 }
