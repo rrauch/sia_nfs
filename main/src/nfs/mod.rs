@@ -15,6 +15,7 @@ use nfsserve::nfs::{
     fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3,
 };
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
+use std::cmp::min;
 use std::io::SeekFrom;
 use std::sync::Arc;
 use std::time::Duration;
@@ -89,15 +90,16 @@ impl NFSFileSystem for SiaNfsFs {
 
         // make sure we don't read beyond eof
         let count = {
-            let count = count as u64;
-            if offset + count >= file.size() {
-                (file.size() - offset) as usize
+            if offset >= file.size() {
+                0
             } else {
-                count as usize
+                let available = file.size() - offset;
+                min(count, available as u32) as usize
             }
         };
 
         if count == 0 {
+            tracing::debug!(offset, "read attempt beyond eof detected");
             return Ok((vec![], true));
         }
 
