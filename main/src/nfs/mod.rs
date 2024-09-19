@@ -116,12 +116,20 @@ impl NFSFileSystem for SiaNfsFs {
             })?;
 
         let mut buf = Vec::with_capacity(count);
-        buf.resize(buf.capacity(), 0x00);
-        file_reader.read_exact(&mut buf).await.map_err(|e| {
+        let mut file_reader = file_reader.take(count as u64);
+        let bytes_read = file_reader.read_to_end(&mut buf).await.map_err(|e| {
             tracing::error!(error = %e, "read error");
             NFS3ERR_IO
         })?;
-
+        if bytes_read != count {
+            tracing::error!(
+                expected = count,
+                actual = bytes_read,
+                "incorrect number of bytes read"
+            );
+            return Err(NFS3ERR_IO);
+        }
+        let file_reader = file_reader.into_inner();
         Ok((buf, file_reader.eof()))
     }
 
