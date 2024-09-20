@@ -15,4 +15,4 @@ tokio = "1.39"
 tracing = "0.1"
 
 [patch.crates-io]
-nfsserve = { git = "https://github.com/rrauch/nfsserve.git", rev = "57327866361b35c63829ee31cb0fdb4b9f07c08b" }
+nfsserve = { git = "https://github.com/rrauch/nfsserve.git", rev = "dd37ee7a3457024443adcb5d64927cfd7684d8b8" }

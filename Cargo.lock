@@ -1265,7 +1265,7 @@ dependencies = [
 [[package]]
 name = "nfsserve"
 version = "0.10.2"
-source = "git+https://github.com/rrauch/nfsserve.git?rev=57327866361b35c63829ee31cb0fdb4b9f07c08b#57327866361b35c63829ee31cb0fdb4b9f07c08b"
+source = "git+https://github.com/rrauch/nfsserve.git?rev=dd37ee7a3457024443adcb5d64927cfd7684d8b8#dd37ee7a3457024443adcb5d64927cfd7684d8b8"
 dependencies = [
  "anyhow",
  "async-trait",

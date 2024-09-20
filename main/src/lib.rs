@@ -67,13 +67,14 @@ impl SiaNfs {
             .await?,
         );
 
-        Ok(Self {
-            listener: NFSTcpListener::bind(
-                listen_address,
-                SiaNfsFs::new(vfs, Duration::from_secs(5), uid, gid, file_mode, dir_mode),
-            )
-            .await?,
-        })
+        let mut listener = NFSTcpListener::bind(
+            listen_address,
+            SiaNfsFs::new(vfs, Duration::from_secs(5), uid, gid, file_mode, dir_mode),
+        )
+        .await?;
+        listener.with_export_name("sia");
+
+        Ok(Self { listener })
     }
 
     pub async fn run(self) -> Result<()> {
