@@ -397,14 +397,20 @@ impl SiaNfsFs {
                 Inode::Object(Object::File(_)) => ftype3::NF3REG,
             },
             mode: match inode {
-                Inode::Root(_) => self.dir_mode,
+                Inode::Root(_) => 0o555,
                 Inode::Bucket(_) => self.dir_mode,
                 Inode::Object(Object::Directory(_)) => self.dir_mode,
                 Inode::Object(Object::File(_)) => self.file_mode,
             },
             nlink: 1,
-            uid: self.uid,
-            gid: self.gid,
+            uid: match inode {
+                Inode::Root(_) => 0,
+                _ => self.uid,
+            },
+            gid: match inode {
+                Inode::Root(_) => 0,
+                _ => self.gid,
+            },
             size,
             used: size,
             rdev: specdata3::default(),
