@@ -33,6 +33,7 @@ impl SiaNfs {
         gid: u32,
         file_mode: u32,
         dir_mode: u32,
+        write_autocommit_after: Duration,
     ) -> Result<Self> {
         let renterd = renterd_client::ClientBuilder::new()
             .api_endpoint_url(renterd_endpoint)
@@ -69,7 +70,7 @@ impl SiaNfs {
 
         let mut listener = NFSTcpListener::bind(
             listen_address,
-            SiaNfsFs::new(vfs, Duration::from_secs(10), uid, gid, file_mode, dir_mode),
+            SiaNfsFs::new(vfs, write_autocommit_after, uid, gid, file_mode, dir_mode),
         )
         .await?;
         listener.with_export_name("sia");

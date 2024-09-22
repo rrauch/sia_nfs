@@ -3,6 +3,7 @@ use clap::Parser;
 use sia_nfs::SiaNfs;
 use std::num::ParseIntError;
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{Instrument, Level};
 use tracing_subscriber::EnvFilter;
@@ -54,6 +55,11 @@ struct Arguments {
     #[clap(default_value = "0700")]
     #[clap(value_parser = parse_octal)]
     dir_mode: u32,
+    /// Time without write activity after which a new file is considered complete.
+    #[arg(long, env)]
+    #[clap(default_value = "10s")]
+    #[clap(value_parser = humantime::parse_duration)]
+    write_autocommit_after: Duration,
 }
 
 #[tokio::main]
@@ -94,6 +100,7 @@ async fn main() -> anyhow::Result<()> {
         arguments.gid,
         arguments.file_mode,
         arguments.dir_mode,
+        arguments.write_autocommit_after,
     )
     .await?;
 
