@@ -8,11 +8,12 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures_util::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use nfsserve::nfs;
 use nfsserve::nfs::nfsstat3::{
     NFS3ERR_IO, NFS3ERR_ISDIR, NFS3ERR_NOENT, NFS3ERR_NOTDIR, NFS3ERR_NOTSUPP, NFS3ERR_SERVERFAULT,
 };
 use nfsserve::nfs::{
-    fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3,
+    fattr3, fileid3, filename3, fsinfo3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3,
 };
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use std::cmp::min;
@@ -341,6 +342,31 @@ impl NFSFileSystem for SiaNfsFs {
 
     async fn readlink(&self, _id: fileid3) -> Result<nfspath3, nfsstat3> {
         Err(NFS3ERR_NOTSUPP)
+    }
+
+    async fn fsinfo(&self, root_fileid: fileid3) -> std::result::Result<fsinfo3, nfsstat3> {
+        let inode = self.inode_by_id(root_fileid).await?;
+        match inode {
+            Inode::Root(_) => {}
+            Inode::Bucket(_) => {}
+            _ => return Err(nfsstat3::NFS3ERR_BADHANDLE),
+        }
+        Ok(fsinfo3 {
+            obj_attributes: nfs::post_op_attr::attributes(self.to_fattr3(&inode)),
+            rtmax: 1024 * 1024,
+            rtpref: 1024 * 124,
+            rtmult: 1024 * 1024,
+            wtmax: 1024 * 1024,
+            wtpref: 1024 * 1024,
+            wtmult: 1024 * 1024,
+            dtpref: 1024 * 1024,
+            maxfilesize: 128 * 1024 * 1024 * 1024,
+            time_delta: nfstime3 {
+                seconds: 0,
+                nseconds: 1000000,
+            },
+            properties: nfs::FSF_HOMOGENEOUS,
+        })
     }
 }
 
