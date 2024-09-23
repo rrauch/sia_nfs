@@ -27,15 +27,15 @@ systems.
 - **File Reading:** Files can be read as expected, including seeking.
 - **File Writing:** New files can be created and written to, including copying an existing file.
 
-**Note:** Existing files cannot be written to as Sia objects are immutable. 
+**Note:** Existing files cannot be written to as Sia objects are immutable.
 
 ## Status
 
-**BETA** The project has progressed well and is now in a *mostly* usable state.
-That being said, this is still a fairly early version with some limitation, caveats &
-certainly some bugs.
-At this point it is **not recommend** to use `sia_nfs` with important data. 
-The server has been tested on Linux (x86_64). Clients have been tested on Linux, macOS & Windows.
+**BETA**: The project has progressed well and is now in a fairly usable state. However, this version is not yet
+considered mature and comes with some limitations, caveats, and certainly some bugs. At this point, it is **not
+recommended** to use `sia_nfs` with important data.
+
+The server has been tested on Linux (x86_64). Clients have been tested on Linux, macOS, and Windows.
 
 *Use at your own risk.*
 
@@ -87,15 +87,15 @@ Replace `[host]` with the address of the machine where the Docker container is r
 #### On Linux (`sudo` may be required):
 
 ```bash
-mkdir demo
-mount -t nfs -o nolock,vers=3,tcp,port=12000,mountport=12000,soft [host]:/ demo/
+mkdir sia
+mount -t nfs -o nolock,vers=3,tcp,port=12000,mountport=12000,soft [host]:/sia sia
 ```
 
 #### On macOS:
 
 ```bash
-mkdir demo
-mount_nfs -o nolocks,vers=3,tcp,port=12000,mountport=12000 [host]:/ demo
+mkdir sia
+mount_nfs -o nolocks,vers=3,tcp,port=12000,mountport=12000 [host]:/sia sia
 ```
 
 #### On Windows:
@@ -104,7 +104,7 @@ mount_nfs -o nolocks,vers=3,tcp,port=12000,mountport=12000 [host]:/ demo
 installed by default, so you may need to add it manually.
 
 ```bash
-mount.exe -o anon,nolock \\[host]\\ X:
+mount.exe -o anon,nolock \\[host]\sia S:
 ```
 
 **Another Note:** Windows expects the NFS mount port to be `111` and does not allow you to specify a different one. You
@@ -118,13 +118,73 @@ docker run -it --rm -p 111:111 -v sia_nfs_data:/data sia_nfs -e [renterd_api_end
 and/or `rpcbind.socket` are running on your system. Ensure both are stopped and that nothing is listening on port `111`
 before trying again.
 
+## Caching
+
+`sia_nfs` caches both metadata and content. *Metadata* caching is always active and automatically syncs with `renterd`,
+either periodically or whenever a file system change is made via `sia_nfs`.
+
+*Content* is cached in deduplicated chunks and is always checked against `renterd` to ensure no stale content is
+delivered. By default, the disk cache is limited to a maximum size of `2 GiB`. This can be configured using
+the `--max-cache-size` argument. Setting this value to `0` completely disables the disk cache. The location of the disk
+cache can also be configured via the `--cache-dir` argument and can be set separately from the `--data-dir`, which
+contains `sia_nfs`'s main persistent data, such as the metadata cache.
+
+**Please note:** Changes made directly to `renterd` (not via `sia_nfs`) will **NOT** be reflected immediately, as there
+is currently no mechanism to receive notifications of changes via the `renterd` API.
+
 ## Known Issues & Limitations
 
-- As mentioned above, file content can **NOT** be modified. Files can be renamed, moved around etc. but writing to / overwriting existing files is not possible.
-- On Windows: currently renaming files and directories can lead to an `Invalid Device` error from Explorer. This seems to be a known issue with NFS & Windows.
-- On macOS: Copying files to a `sia_nfs` folder with Finder leads to a "File already exists" error. Copying files via CLI works fine, so this can be used as a workaround for now.
-- On macOS: Mounting attempts seem to lead to an infinite loop from the client if `sia_nfs` runs on port `111`. Other ports are fine.
+- As mentioned above, file content can **NOT** be modified. Files can be renamed, moved around etc. but writing to /
+  overwriting existing files is not possible.
+- On Windows: The Windows client requires `sia_nfs` to run on port 111. Other ports are not supported.
+- On macOS: Mounting attempts seem to lead to an infinite loop from the client if `sia_nfs` runs on port `111`. Other
+  ports are fine.
+- Write errors: Due to the stateless nature of NFSv3, `sia_nfs` cannot clearly determine when a client is done writing
+  to a file, as there is no `close` call or equivalent. A file is considered closed if there are no more write calls for
+  a specific amount of time, with the default being `10s`. In rare cases, this can lead to `sia_nfs` closing a file
+  prematurely if the client pauses writing but hasn't actually finished. If you encounter this issue, you can adjust the
+  timeout period using the `--write-autocommit-after` argument. For example, you can set it to `20s`, `30s` or
+  even `1min` to better suit your specific situation.
 
+## Usage
+
+```bash
+:~$ sia_nfs --help
+Exports Sia buckets via NFS. Connects to renterd, allowing direct NFS access to exported buckets
+
+Usage: sia_nfs [OPTIONS] --renterd-api-endpoint <RENTERD_API_ENDPOINT> --renterd-api-password <RENTERD_API_PASSWORD> --data-dir <DATA_DIR> <BUCKETS>...
+
+Arguments:
+  <BUCKETS>...  List of buckets to export
+
+Options:
+  -e, --renterd-api-endpoint <RENTERD_API_ENDPOINT>
+          URL for renterd's API endpoint (e.g., http://localhost:9880/api/) [env: RENTERD_API_ENDPOINT=]
+  -s, --renterd-api-password <RENTERD_API_PASSWORD>
+          Password for the renterd API. It's recommended to use an environment variable for this [env: RENTERD_API_PASSWORD=]
+  -d, --data-dir <DATA_DIR>
+          Directory to store persistent data in. Will be created if it doesn't exist [env: DATA_DIR=/data/]
+  -c, --cache-dir <CACHE_DIR>
+          Optional directory to store the content cache in. Defaults to `DATA_DIR` if not set. Will be created if it doesn't exist [env: CACHE_DIR=]
+  -m, --max-cache-size <MAX_CACHE_SIZE>
+          Maximum size of content cache. Set to `0` to disable [env: MAX_CACHE_SIZE=] [default: "2 GiB"]
+  -l, --listen-address <LISTEN_ADDRESS>
+          Host and port to listen on [env: LISTEN_ADDRESS=0.0.0.0:12000] [default: localhost:12000]
+      --uid <UID>
+          UID of files and directories [env: INODE_UID=] [default: 1000]
+      --gid <GID>
+          GID of files and directories [env: INODE_GID=] [default: 1000]
+      --file-mode <FILE_MODE>
+          Unix file permissions [env: FILE_MODE=] [default: 0600]
+      --dir-mode <DIR_MODE>
+          Unix directory permissions [env: DIR_MODE=] [default: 0700]
+      --write-autocommit-after <WRITE_AUTOCOMMIT_AFTER>
+          Time without write activity after which a new file is considered complete [env: WRITE_AUTOCOMMIT_AFTER=] [default: 10s]
+  -h, --help
+          Print help
+  -V, --version
+          Print version
+```
 
 ## License
 
