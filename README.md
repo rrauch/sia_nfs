@@ -69,7 +69,7 @@ docker tag ghcr.io/rrauch/sia_nfs:latest sia_nfs:latest
 docker volume create sia_nfs_data
 
 # Run the Docker container in the foreground
-docker run -it --rm -p 12000:12000 -v sia_nfs_data:/config sia_nfs -e [renterd_api_endpoint] -s [renterd_api_password] [bucket..]
+docker run -it --rm -p 12000:12000 -v sia_nfs_data:/data sia_nfs -e [renterd_api_endpoint] -s [renterd_api_password] [bucket..]
 ```
 
 Replace `[renterd_api_endpoint]` with the URL of your renterd API, e.g., `http://localhost:9880/api/`.
@@ -111,7 +111,7 @@ mount.exe -o anon,nolock \\[host]\\ X:
 need to run the Docker container with this command:
 
 ```bash
-docker run -it --rm -p 111:111 -v sia_nfs_data:/config sia_nfs -e [renterd_api_endpoint] -s [renterd_api_password] -l 0.0.0.0:111 [bucket..]
+docker run -it --rm -p 111:111 -v sia_nfs_data:/data sia_nfs -e [renterd_api_endpoint] -s [renterd_api_password] -l 0.0.0.0:111 [bucket..]
 ```
 
 **Third Note:** If you encounter the error `failed to bind port 0.0.0.0:111/tcp`, check if `rpcbind.service`

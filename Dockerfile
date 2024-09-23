@@ -49,9 +49,9 @@ WORKDIR /
 # Copy files from the `builder` stage.
 COPY --from=builder /export/ /
 
-VOLUME /config
+VOLUME /data
 EXPOSE 12000
-ENV DATA_DIR="/config/"
+ENV DATA_DIR="/data/"
 ENV LISTEN_ADDRESS="0.0.0.0:12000"
 
 ENTRYPOINT ["/usr/local/bin/sia_nfs"]
